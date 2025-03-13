@@ -40,7 +40,7 @@ import requests
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 
-from scripts.go2_lidar_decoder import LidarDecoder
+from scripts_go2.go2_lidar_decoder import LidarDecoder
 
 
 logging.basicConfig(level=logging.WARN)
