@@ -102,8 +102,9 @@ class RobotBaseNode(Node):
 
         self.conn = {}
         qos_profile = QoSProfile(depth=10)
-        best_effort_qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        # Change from BEST_EFFORT to RELIABLE for better compatibility
+        reliable_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1
         )
@@ -126,7 +127,7 @@ class RobotBaseNode(Node):
                 self.create_publisher(
                     PointCloud2,
                     'point_cloud2',
-                    best_effort_qos,
+                    reliable_qos,
                     qos_overriding_options=QoSOverridingOptions.with_default_policies()))
             self.go2_odometry_pub.append(
                 self.create_publisher(Odometry, 'odom', qos_profile))
@@ -136,20 +137,20 @@ class RobotBaseNode(Node):
                     self.create_publisher(
                         Image,
                         'camera/image_raw',
-                        best_effort_qos,
+                        reliable_qos,
                         qos_overriding_options=QoSOverridingOptions.with_default_policies()))
                 self.camera_info_pub.append(
                     self.create_publisher(
                         CameraInfo,
                         'camera/camera_info',
-                        best_effort_qos,
+                        reliable_qos,
                         qos_overriding_options=QoSOverridingOptions.with_default_policies()))
             if self.publish_raw_voxel:
                 self.voxel_pub.append(
                     self.create_publisher(
                         VoxelMapCompressed,
                         '/utlidar/voxel_map_compressed',
-                        best_effort_qos))
+                        reliable_qos))
 
         else:
             for i in range(len(self.robot_ip_lst)):
@@ -161,7 +162,7 @@ class RobotBaseNode(Node):
                     self.create_publisher(
                         PointCloud2,
                         f'robot{i}/point_cloud2',
-                        best_effort_qos,
+                        reliable_qos,
                         qos_overriding_options=QoSOverridingOptions.with_default_policies()))
                 self.go2_odometry_pub.append(self.create_publisher(
                     Odometry, f'robot{i}/odom', qos_profile))
@@ -172,20 +173,20 @@ class RobotBaseNode(Node):
                         self.create_publisher(
                             Image,
                             f'robot{i}/camera/image_raw',
-                            best_effort_qos,
+                            reliable_qos,
                             qos_overriding_options=QoSOverridingOptions.with_default_policies()))
                     self.camera_info_pub.append(
                         self.create_publisher(
                             CameraInfo,
                             f'robot{i}/camera/camera_info',
-                            best_effort_qos,
+                            reliable_qos,
                             qos_overriding_options=QoSOverridingOptions.with_default_policies()))
                 if self.publish_raw_voxel:
                     self.voxel_pub.append(
                         self.create_publisher(
                             VoxelMapCompressed,
                             f'robot{i}/utlidar/voxel_map_compressed',
-                            best_effort_qos))
+                            reliable_qos))
 
         self.broadcaster = TransformBroadcaster(self, qos=qos_profile)
 
