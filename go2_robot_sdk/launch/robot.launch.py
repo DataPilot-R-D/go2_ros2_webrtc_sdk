@@ -34,11 +34,11 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     with_rviz2 = LaunchConfiguration('rviz2', default='true')
-    # with_nav2 = LaunchConfiguration('nav2', default='true')
-    # with_slam = LaunchConfiguration('slam', default='true')
+    with_nav2 = LaunchConfiguration('nav2', default='true')
+    with_slam = LaunchConfiguration('slam', default='true')
     # with_foxglove = LaunchConfiguration('foxglove', default='true')
-    # with_joystick = LaunchConfiguration('joystick', default='true')
-    # with_teleop = LaunchConfiguration('teleop', default='true')
+    with_joystick = LaunchConfiguration('joystick', default='true')
+    with_teleop = LaunchConfiguration('teleop', default='true')
 
     robot_token = os.getenv('ROBOT_TOKEN', '') # how does this work for multiple robots?
     robot_ip = os.getenv('ROBOT_IP', '')
@@ -82,9 +82,9 @@ def generate_launch_description():
         'config', 'joystick.yaml'
     )
 
-    # default_config_topics = os.path.join(
-    #     get_package_share_directory('go2_robot_sdk'),
-    #     'config', 'twist_mux.yaml')
+    default_config_topics = os.path.join(
+        get_package_share_directory('go2_robot_sdk'),
+        'config', 'twist_mux.yaml')
 
     # foxglove_launch = os.path.join(
     #     get_package_share_directory('foxglove_bridge'),
@@ -92,17 +92,17 @@ def generate_launch_description():
     #     'foxglove_bridge_launch.xml',
     # )
 
-    # slam_toolbox_config = os.path.join(
-    #     get_package_share_directory('go2_robot_sdk'),
-    #     'config',
-    #     'mapper_params_online_async.yaml'
-    # )
+    slam_toolbox_config = os.path.join(
+        get_package_share_directory('go2_robot_sdk'),
+        'config',
+        'mapper_params_online_async.yaml'
+    )
 
-    # nav2_config = os.path.join(
-    #     get_package_share_directory('go2_robot_sdk'),
-    #     'config',
-    #     'nav2_params.yaml'
-    # )
+    nav2_config = os.path.join(
+        get_package_share_directory('go2_robot_sdk'),
+        'config',
+        'nav2_params.yaml'
+    )
 
     if conn_mode == 'single':
 
@@ -195,56 +195,56 @@ def generate_launch_description():
             name='rviz2',
             arguments=['-d' + os.path.join(get_package_share_directory('go2_robot_sdk'), 'config', rviz_config)]
         ),
-        # Node(
-        #     package='joy',
-        #     executable='joy_node',
-        #     condition=IfCondition(with_joystick),
-        #     parameters=[joy_params]
-        # ),
-        # Node(
-        #     package='teleop_twist_joy',
-        #     executable='teleop_node',
-        #     name='teleop_node',
-        #     condition=IfCondition(with_joystick),
-        #     parameters=[default_config_topics],
-        # ),
-        # Node(
-        #     package='twist_mux',
-        #     executable='twist_mux',
-        #     output='screen',
-        #     condition=IfCondition(with_teleop),
-        #     parameters=[
-        #         {'use_sim_time': use_sim_time},
-        #         default_config_topics
-        #     ],
-        # ),
+        Node(
+            package='joy',
+            executable='joy_node',
+            condition=IfCondition(with_joystick),
+            parameters=[joy_params]
+        ),
+        Node(
+            package='teleop_twist_joy',
+            executable='teleop_node',
+            name='teleop_node',
+            condition=IfCondition(with_joystick),
+            parameters=[default_config_topics],
+        ),
+        Node(
+            package='twist_mux',
+            executable='twist_mux',
+            output='screen',
+            condition=IfCondition(with_teleop),
+            parameters=[
+                {'use_sim_time': use_sim_time},
+                default_config_topics
+            ],
+        ),
 
         # IncludeLaunchDescription(
         #     FrontendLaunchDescriptionSource(foxglove_launch),
         #     condition=IfCondition(with_foxglove),
         # ),
 
-        # IncludeLaunchDescription(
-        #     PythonLaunchDescriptionSource([
-        #         os.path.join(get_package_share_directory(
-        #             'slam_toolbox'), 'launch', 'online_async_launch.py')
-        #     ]),
-        #     condition=IfCondition(with_slam),
-        #     launch_arguments={
-        #         'slam_params_file': slam_toolbox_config,
-        #         'use_sim_time': use_sim_time,
-        #     }.items(),
-        # ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([
+                os.path.join(get_package_share_directory(
+                    'slam_toolbox'), 'launch', 'online_async_launch.py')
+            ]),
+            condition=IfCondition(with_slam),
+            launch_arguments={
+                'slam_params_file': slam_toolbox_config,
+                'use_sim_time': use_sim_time,
+            }.items(),
+        ),
 
-        # IncludeLaunchDescription(
-        #     PythonLaunchDescriptionSource([
-        #         os.path.join(get_package_share_directory(
-        #             'nav2_bringup'), 'launch', 'navigation_launch.py')
-        #     ]),
-        #     condition=IfCondition(with_nav2),
-        #     launch_arguments={
-        #         'params_file': nav2_config,
-        #         'use_sim_time': use_sim_time,
-        #     }.items(),
-        # ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([
+                os.path.join(get_package_share_directory(
+                    'nav2_bringup'), 'launch', 'navigation_launch.py')
+            ]),
+            condition=IfCondition(with_nav2),
+            launch_arguments={
+                'params_file': nav2_config,
+                'use_sim_time': use_sim_time,
+            }.items(),
+        ),
     ])
