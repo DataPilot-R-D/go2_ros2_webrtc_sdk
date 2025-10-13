@@ -1,4 +1,6 @@
 # Pluto Calibration
+# We preformed our own camera calibration following 
+# https://medium.com/starschema-blog/offline-camera-calibration-in-ros-2-45e81df12555
 
 image_width: 1280
 image_height: 720
