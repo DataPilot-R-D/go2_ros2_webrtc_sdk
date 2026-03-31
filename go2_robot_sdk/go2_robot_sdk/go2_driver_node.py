@@ -27,6 +27,7 @@ import logging
 import os
 import threading
 import asyncio
+import time
 
 from aiortc import MediaStreamTrack
 from cv_bridge import CvBridge
@@ -45,8 +46,7 @@ from rclpy.qos import QoSProfile
 
 from tf2_ros import TransformBroadcaster, TransformStamped
 from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
-from go2_interfaces.msg import Go2State, IMU
-from unitree_go.msg import LowState
+from go2_interfaces.msg import Go2State, IMU, LowState
 from sensor_msgs.msg import PointCloud2, PointField, JointState, Joy
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
@@ -185,24 +185,43 @@ class RobotBaseNode(Node):
 
     def timer_callback(self):
         if self.conn_type == 'webrtc':
-            self.publish_odom_webrtc()
-            self.publish_odom_topic_webrtc()
-            self.publish_robot_state_webrtc()
-            self.publish_joint_state_webrtc()
+            try:
+                self.publish_odom_webrtc()
+                self.publish_odom_topic_webrtc()
+                self.publish_robot_state_webrtc()
+                self.publish_joint_state_webrtc()
+            except Exception as e:
+                self.get_logger().debug(f"Publish error: {e}")
 
     def timer_callback_lidar(self):
         if self.conn_type == 'webrtc':
-            self.publish_lidar_webrtc()
+            try:
+                self.publish_lidar_webrtc()
+            except Exception as e:
+                self.get_logger().debug(f"Lidar publish error: {e}")
 
     def cmd_vel_cb(self, msg, robot_num):
         x = msg.linear.x
         y = msg.linear.y
         z = msg.angular.z
 
-        # Allow omni-directional movement
+        # Use rt/wirelesscontroller (joystick emulation) for reliable locomotion
+        # Coordinate mapping: ROS twist -> Unitree joystick
+        #   ly = forward/back (twist.linear.x)
+        #   lx = strafe left/right (-twist.linear.y for Unitree convention)
+        #   rx = turn (-twist.angular.z for Unitree convention)
         if x != 0.0 or y != 0.0 or z != 0.0:
-            self.robot_cmd_vel[robot_num] = gen_mov_command(
-                round(x, 2), round(y, 2), round(z, 2))
+            self.robot_cmd_vel[robot_num] = json.dumps({
+                "type": "msg",
+                "topic": "rt/wirelesscontroller",
+                "data": {"lx": round(-y, 2), "ly": round(x, 2), "rx": round(-z, 2), "ry": 0}
+            })
+        else:
+            self.robot_cmd_vel[robot_num] = json.dumps({
+                "type": "msg",
+                "topic": "rt/wirelesscontroller",
+                "data": {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
+            })
 
 
     def joy_cb(self, msg):
@@ -244,62 +263,75 @@ class RobotBaseNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         self.go2_lidar_pub[0].publish(msg)
 
+    def _send_dc(self, robot_num, payload):
+        """Send payload over data channel."""
+        conn = self.conn[robot_num]
+        if not conn.data_channel_opened:
+            return
+        conn.data_channel.send(payload)
+
     def joy_cmd(self, robot_num):
 
         if self.conn_type == 'webrtc':
-            if robot_num in self.conn and robot_num in self.robot_cmd_vel and self.robot_cmd_vel[robot_num] != None:
+            if robot_num in self.conn and robot_num in self.robot_cmd_vel and self.robot_cmd_vel[robot_num] is not None:
                 self.get_logger().info("Move")
-                self.conn[robot_num].data_channel.send(
-                    self.robot_cmd_vel[robot_num])
+                self._send_dc(robot_num, self.robot_cmd_vel[robot_num])
                 self.robot_cmd_vel[robot_num] = None
 
             if robot_num in self.conn and self.joy_state.buttons and self.joy_state.buttons[1]:
                 self.get_logger().info("Stand down")
                 stand_down_cmd = gen_command(ROBOT_CMD["StandDown"])
-                self.conn[robot_num].data_channel.send(stand_down_cmd)
+                self._send_dc(robot_num, stand_down_cmd)
 
             if robot_num in self.conn and self.joy_state.buttons and self.joy_state.buttons[0]:
                 self.get_logger().info("Stand up")
                 stand_up_cmd = gen_command(ROBOT_CMD["StandUp"])
-                self.conn[robot_num].data_channel.send(stand_up_cmd)
+                self._send_dc(robot_num, stand_up_cmd)
                 move_cmd = gen_command(ROBOT_CMD['BalanceStand'])
                 self.conn[robot_num].data_channel.send(move_cmd)
 
     def on_validated(self, robot_num):
         if robot_num in self.conn:
+            dc = self.conn[robot_num].data_channel
+            self.get_logger().info(
+                f"Subscribing to {len(RTC_TOPIC)} topics on DC "
+                f"(state={dc.readyState})")
+            # Enable video stream from robot
+            dc.send(json.dumps({"type": "vid", "topic": "", "data": "on"}))
             for topic in RTC_TOPIC.values():
-                self.conn[robot_num].data_channel.send(
-                    json.dumps({"type": "subscribe", "topic": topic}))
+                dc.send(json.dumps({"type": "subscribe", "topic": topic}))
 
     async def on_video_frame(self, track: MediaStreamTrack, robot_num):
-        logger.info(f"Video frame received for robot {robot_num}")
+        logger.info(f"Video frame loop starting for robot {robot_num}")
+        frame_count = 0
 
-        while True:
-            frame = await track.recv()
-            img = frame.to_ndarray(format="bgr24")
+        try:
+            while True:
+                frame = await track.recv()
+                frame_count += 1
+                img = frame.to_ndarray(format="bgr24")
 
-            logger.debug(f"Shape: {img.shape}, Dimensions: {img.ndim}, Type: {img.dtype}, Size: {img.size}")
+                if frame_count <= 3 or frame_count % 100 == 0:
+                    logger.info(f"Video frame #{frame_count}: {img.shape}")
 
-            # Convert the OpenCV image to ROS Image message
-            ros_image = self.bridge.cv2_to_imgmsg(img, encoding="bgr8")
-            ros_image.header.stamp = self.get_clock().now().to_msg()
+                ros_image = self.bridge.cv2_to_imgmsg(img, encoding="bgr8")
+                ros_image.header.stamp = self.get_clock().now().to_msg()
 
+                camera_info = self.camera_info
+                camera_info.header.stamp = ros_image.header.stamp
 
-            # Set the timestamp for both image and camera info
-            camera_info = self.camera_info
-            camera_info.header.stamp = ros_image.header.stamp
-            
-            if self.conn_mode == 'single':
-                camera_info.header.frame_id = 'front_camera'
-                ros_image.header.frame_id = 'front_camera'
-            else:
-                camera_info.header.frame_id = f'robot{str(robot_num)}/front_camera'
-                ros_image.header.frame_id = f'robot{str(robot_num)}/front_camera'
+                if self.conn_mode == 'single':
+                    camera_info.header.frame_id = 'front_camera'
+                    ros_image.header.frame_id = 'front_camera'
+                else:
+                    camera_info.header.frame_id = f'robot{str(robot_num)}/front_camera'
+                    ros_image.header.frame_id = f'robot{str(robot_num)}/front_camera'
 
-            # Publish image and camera info
-            self.img_pub[robot_num].publish(ros_image)
-            self.camera_info_pub[robot_num].publish(camera_info)
-            asyncio.sleep(0)
+                self.img_pub[robot_num].publish(ros_image)
+                self.camera_info_pub[robot_num].publish(camera_info)
+                await asyncio.sleep(0)
+        except Exception as e:
+            logger.error(f"Video frame loop crashed after {frame_count} frames: {e}")
 
     def on_data_channel_message(self, _, msg, robot_num):
 
@@ -523,15 +555,39 @@ class RobotBaseNode(Node):
                     i)]["data"]["imu_state"]["temperature"]
                 self.imu_pub[i].publish(imu)
 
-    async def run(self, conn, robot_num):
+    async def connect_robot(self, robot_ip, robot_num, token):
+        """Connect a single robot via WebRTC. Must be called before spin starts."""
+        conn = Go2Connection(
+            robot_ip=robot_ip,
+            robot_num=robot_num,
+            token=token,
+            on_validated=self.on_validated,
+            on_message=self.on_data_channel_message,
+            on_video_frame=self.on_video_frame,
+        )
+
         self.conn[robot_num] = conn
 
         if self.conn_type == 'webrtc':
-            await self.conn[robot_num].connect()
-            # await self.conn[robot_num].data_channel.disableTrafficSaving(True)
+            await conn.connect()
 
+            if conn.data_channel_opened:
+                self.get_logger().info(
+                    f"Robot {robot_num}: data channel validated and ready!")
+                # Subscribe to robot topics. The library handled validation
+                # internally, so our on_validated callback was never triggered.
+                self.on_validated(robot_num)
+            else:
+                self.get_logger().warn(
+                    f"Robot {robot_num}: data channel validation did not complete")
+
+    async def joy_cmd_loop(self, robot_num):
+        """Continuously send joystick commands to a connected robot."""
         while True:
-            self.joy_cmd(robot_num)
+            try:
+                self.joy_cmd(robot_num)
+            except Exception as e:
+                self.get_logger().warn(f"joy_cmd error: {e}")
             await asyncio.sleep(0.1)
 
 
@@ -542,13 +598,16 @@ async def spin(node: Node):
               future: asyncio.Future,
               event_loop: asyncio.AbstractEventLoop):
         while not future.cancelled():
-            rclpy.spin_once(node)
+            rclpy.spin_once(node, timeout_sec=0.05)
+            # Yield the GIL briefly so the asyncio event loop can process
+            # aiortc SCTP packets and data channel messages
+            time.sleep(0.001)
         if not future.cancelled():
             event_loop.call_soon_threadsafe(future.set_result, None)
     event_loop = asyncio.get_event_loop()
     spin_task = event_loop.create_future()
     spin_thread = threading.Thread(
-        target=_spin, args=(node, spin_task, event_loop))
+        target=_spin, args=(node, spin_task, event_loop), daemon=True)
     spin_thread.start()
     try:
         await spin_task
@@ -560,24 +619,31 @@ async def spin(node: Node):
 
 async def start_node():
     base_node = RobotBaseNode()
-    spin_task = asyncio.get_event_loop().create_task(spin(base_node))
-    sleep_task_lst = []
 
+    # Phase 1: Connect all robots BEFORE starting the spin thread.
+    # The spin thread's rclpy.spin_once() holds the GIL in a tight loop,
+    # which starves the asyncio event loop and prevents aiortc from
+    # processing SCTP packets needed for data channel validation.
     for i in range(len(base_node.robot_ip_lst)):
-
-        conn = Go2Connection(
+        base_node.get_logger().info(
+            f"Connecting to robot {i} at {base_node.robot_ip_lst[i]}...")
+        await base_node.connect_robot(
             robot_ip=base_node.robot_ip_lst[i],
             robot_num=str(i),
             token=base_node.token,
-            on_validated=base_node.on_validated,
-            on_message=base_node.on_data_channel_message,
-            on_video_frame=base_node.on_video_frame,
         )
 
-        sleep_task_lst.append(asyncio.get_event_loop(
-        ).create_task(base_node.run(conn, str(i))))
+    # Phase 2: Now start the spin thread and joy_cmd loops.
+    base_node.get_logger().info("Phase 2: starting spin thread and joy_cmd loops")
+    event_loop = asyncio.get_event_loop()
+    spin_task = event_loop.create_task(spin(base_node))
+    joy_tasks = [
+        event_loop.create_task(base_node.joy_cmd_loop(str(i)))
+        for i in range(len(base_node.robot_ip_lst))
+    ]
 
-    await asyncio.wait([spin_task, *sleep_task_lst], return_when=asyncio.FIRST_COMPLETED)
+    await asyncio.wait(
+        [spin_task, *joy_tasks], return_when=asyncio.FIRST_COMPLETED)
 
 
 def main():

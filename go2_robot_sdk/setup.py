@@ -41,9 +41,8 @@ setup(
         (os.path.join('share', package_name, 'config'), glob(os.path.join('config', '*'))),
         (os.path.join('share', package_name, 'external_lib'), ['external_lib/libvoxel.wasm']),
         (os.path.join('share', package_name, 'external_lib/aioice'), glob(os.path.join('external_lib/aioice/src/aioice', '*'))),
-        
-        
-
+        (os.path.join('share', package_name, 'urdf'), glob(os.path.join('urdf', '*.urdf'))),
+        (os.path.join('share', package_name, 'calibration'), glob(os.path.join('calibration', '*.yaml'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -55,6 +54,7 @@ setup(
     entry_points={
         'console_scripts': [
             'go2_driver_node = go2_robot_sdk.go2_driver_node:main',
+            'bridge_driver_node = go2_robot_sdk.bridge_driver_node:main',
             'lidar_to_pointcloud = go2_robot_sdk.lidar_to_point:main',
             'example_nav_through_poses = nav2_simple_commander.example_nav_through_poses:main',
             'demo_security = nav2_simple_commander.demo_security:main',
