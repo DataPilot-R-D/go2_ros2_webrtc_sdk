@@ -49,7 +49,7 @@ from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
 from go2_interfaces.msg import Go2State, IMU, LowState
 from sensor_msgs.msg import PointCloud2, PointField, JointState, Joy
 from sensor_msgs_py import point_cloud2
-from std_msgs.msg import Header
+from std_msgs.msg import Empty, Header, String
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, CameraInfo
 
@@ -96,6 +96,9 @@ class RobotBaseNode(Node):
         self.imu_pub = []
         self.img_pub = []
         self.camera_info_pub = []
+        # battery_state is a JSON-encoded String — matches Robot Bridge's
+        # generic battery parser (voltage + percentage + charging).
+        self.battery_pub = []
 
         if self.conn_mode == 'single':
             self.joint_pub.append(self.create_publisher(
@@ -109,6 +112,7 @@ class RobotBaseNode(Node):
             self.imu_pub.append(self.create_publisher(IMU, 'imu', qos_profile))
             self.img_pub.append(self.create_publisher(Image, 'camera/image_raw', qos_profile))
             self.camera_info_pub.append(self.create_publisher(CameraInfo, 'camera/camera_info', qos_profile))
+            self.battery_pub.append(self.create_publisher(String, 'battery_state', qos_profile))
 
         else:
             for i in range(len(self.robot_ip_lst)):
@@ -126,6 +130,8 @@ class RobotBaseNode(Node):
                     Image, f'robot{i}/camera/image_raw', qos_profile))
                 self.camera_info_pub.append(self.create_publisher(
                     CameraInfo, f'robot{i}/camera/camera_info', qos_profile))
+                self.battery_pub.append(self.create_publisher(
+                    String, f'robot{i}/battery_state', qos_profile))
 
         self.broadcaster = TransformBroadcaster(self, qos=qos_profile)
 
@@ -140,24 +146,67 @@ class RobotBaseNode(Node):
 
         self.joy_state = Joy()
 
+        # Subscribe to cmd_vel_out (legacy — expected from twist_mux when
+        # installed), cmd_vel_teleop (PAIC2 Robot Bridge) and cmd_vel
+        # (Nav2 output). ros2_m1_native on M1 has no twist_mux package,
+        # so we mux inside the driver: whichever topic has a fresh value
+        # wins, teleop gets priority by being subscribed last.
+        _cmd_topics = ('cmd_vel', 'cmd_vel_teleop', 'cmd_vel_out')
         if self.conn_mode == 'single':
-            self.create_subscription(
-                Twist,
-                'cmd_vel_out',
-                lambda msg: self.cmd_vel_cb(msg, "0"),
-                qos_profile)
-        else:
-            for i in range(len(self.robot_ip_lst)):
+            for topic in _cmd_topics:
                 self.create_subscription(
                     Twist,
-                    f'robot{str(i)}/cmd_vel_out',
-                    lambda msg: self.cmd_vel_cb(msg, str(i)),
+                    topic,
+                    lambda msg: self.cmd_vel_cb(msg, "0"),
                     qos_profile)
+        else:
+            for i in range(len(self.robot_ip_lst)):
+                for topic in _cmd_topics:
+                    self.create_subscription(
+                        Twist,
+                        f'robot{str(i)}/{topic}',
+                        lambda msg, ri=str(i): self.cmd_vel_cb(msg, ri),
+                        qos_profile)
 
         self.create_subscription(
             Joy,
             'joy',
             self.joy_cb,
+            qos_profile)
+
+        # Dedicated mode-change ROS topics so the dashboard (or a curl
+        # through rosbridge) can put the dog into BalanceStand / StandUp /
+        # StandDown without emulating a gamepad on /joy. Required for
+        # teleop: Go2 ignores rt/wirelesscontroller while in standby
+        # (mode=0); sending BalanceStand first transitions to gait mode.
+        self.create_subscription(
+            Empty,
+            'stand_up',
+            lambda _msg: self._send_sport_cmd("StandUp"),
+            qos_profile)
+        self.create_subscription(
+            Empty,
+            'balance_stand',
+            lambda _msg: self._send_sport_cmd("BalanceStand"),
+            qos_profile)
+        self.create_subscription(
+            Empty,
+            'stand_down',
+            lambda _msg: self._send_sport_cmd("StandDown"),
+            qos_profile)
+        # Full wake-up sequence — use this when the dog is in an idle
+        # damp/safety state and plain StandUp / BalanceStand aren't
+        # enough. RecoveryStand (1006) forces exit from any abnormal
+        # state, then BalanceStand transitions to gait-ready.
+        self.create_subscription(
+            Empty,
+            'recovery_stand',
+            lambda _msg: self._send_sport_cmd("RecoveryStand"),
+            qos_profile)
+        self.create_subscription(
+            Empty,
+            'wake_up',
+            lambda _msg: self._wake_up_sequence(),
             qos_profile)
 
         # Support for CycloneDDS (EDU version via ethernet)
@@ -192,6 +241,36 @@ class RobotBaseNode(Node):
                 self.publish_joint_state_webrtc()
             except Exception as e:
                 self.get_logger().debug(f"Publish error: {e}")
+            # Keep battery on its own try-block so one failure in the
+            # existing publishers doesn't mask the newer code during rollout.
+            try:
+                self.publish_battery_webrtc()
+            except Exception as e:
+                self.get_logger().warning(f"Battery publish error: {e}")
+
+    def publish_battery_webrtc(self):
+        # Go2 LOW_STATE carries bms_state.soc (0-100) and power_v (volts).
+        # Emit as JSON-in-String so Robot Bridge's generic battery parser
+        # picks it up without needing a Go2-specific message type.
+        for i in range(len(self.battery_pub)):
+            low = self.robot_low_cmd.get(str(i))
+            if not low:
+                continue
+            data = low.get("data", {})
+            bms = data.get("bms_state", {})
+            soc = bms.get("soc")
+            voltage = data.get("power_v")
+            current_ma = bms.get("current")
+            if soc is None and voltage is None:
+                continue
+            payload = {
+                "percentage": float(soc) if soc is not None else 0.0,
+                "voltage": float(voltage) if voltage is not None else 0.0,
+                "charging": bool(current_ma is not None and current_ma > 0),
+            }
+            msg = String()
+            msg.data = json.dumps(payload)
+            self.battery_pub[i].publish(msg)
 
     def timer_callback_lidar(self):
         if self.conn_type == 'webrtc':
@@ -304,6 +383,9 @@ class RobotBaseNode(Node):
     async def on_video_frame(self, track: MediaStreamTrack, robot_num):
         logger.info(f"Video frame loop starting for robot {robot_num}")
         frame_count = 0
+        rtsp_pusher = None
+        # Sticky flag — once ffmpeg is missing we stop logging it every frame
+        rtsp_disabled = False
 
         try:
             while True:
@@ -329,9 +411,130 @@ class RobotBaseNode(Node):
 
                 self.img_pub[robot_num].publish(ros_image)
                 self.camera_info_pub[robot_num].publish(camera_info)
+
+                # Optional RTSP push to go2rtc. Go2 Pro has no standard
+                # RTSP/WHIP endpoint, so we re-encode the WebRTC video
+                # track from aiortc through ffmpeg and PUBLISH it to
+                # go2rtc on localhost. Media Gateway + dashboard then
+                # pick it up as a regular robot_camera stream.
+                rtsp_url = os.environ.get("GO2_RTSP_PUSH_URL", "").strip()
+                if rtsp_url and not rtsp_disabled:
+                    # Dead-process check: ffmpeg frequently exits silently
+                    # after a few minutes when the RTSP server closes the
+                    # TCP session; stdin writes would keep succeeding into
+                    # the kernel buffer, so rely on poll() to detect it.
+                    if rtsp_pusher is not None and rtsp_pusher.poll() is not None:
+                        logger.warning(
+                            f"RTSP pusher exited (code={rtsp_pusher.returncode}) — restarting"
+                        )
+                        rtsp_pusher = None
+                    if rtsp_pusher is None:
+                        rtsp_pusher = self._start_rtsp_pusher(rtsp_url, img.shape)
+                        if rtsp_pusher is None:
+                            # ffmpeg missing — stop trying this frame loop.
+                            rtsp_disabled = True
+                    if rtsp_pusher is not None:
+                        try:
+                            rtsp_pusher.stdin.write(img.tobytes())
+                            rtsp_pusher.stdin.flush()
+                        except (BrokenPipeError, ValueError, OSError):
+                            logger.warning("RTSP pusher pipe broken — restarting")
+                            try:
+                                rtsp_pusher.kill()
+                                rtsp_pusher.wait(timeout=1)
+                            except Exception:
+                                pass
+                            rtsp_pusher = None
+
                 await asyncio.sleep(0)
         except Exception as e:
             logger.error(f"Video frame loop crashed after {frame_count} frames: {e}")
+        finally:
+            if rtsp_pusher is not None:
+                try:
+                    rtsp_pusher.stdin.close()
+                    rtsp_pusher.kill()
+                except Exception:
+                    pass
+
+    def _wake_up_sequence(self) -> None:
+        # RecoveryStand → wait → BalanceStand. Needed after the dog has
+        # been idle long enough to drop into damp / safety mode where
+        # standalone StandUp is silently ignored by the sport controller.
+        import threading
+        def _run():
+            import time
+            for cmd, delay in (("RecoveryStand", 2.0), ("BalanceStand", 0.0)):
+                self._send_sport_cmd(cmd)
+                if delay:
+                    time.sleep(delay)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _send_sport_cmd(self, cmd_name: str) -> None:
+        """Dispatch a ROBOT_CMD API call to every connected robot.
+
+        Used by /stand_up, /balance_stand, /stand_down ROS topics so the
+        dashboard can flip the dog out of standby before teleop.
+        """
+        if cmd_name not in ROBOT_CMD:
+            logger.error(f"Unknown sport cmd: {cmd_name}")
+            return
+        payload = gen_command(ROBOT_CMD[cmd_name])
+        for robot_num, conn in self.conn.items():
+            try:
+                self._send_dc(robot_num, payload)
+                logger.info(f"Sent {cmd_name} to robot {robot_num}")
+            except Exception as exc:
+                logger.warning(f"{cmd_name} dispatch to robot {robot_num} failed: {exc}")
+
+    def _start_rtsp_pusher(self, rtsp_url: str, shape):
+        # shape = (h, w, 3) BGR
+        import shutil
+        import subprocess
+
+        # Kill any leftover ffmpeg processes pushing to the same RTSP
+        # target. Driver restart doesn't clean them up if the python
+        # process was SIGKILL'd; they linger as zombies, hold a TCP
+        # session on go2rtc, and block the fresh pusher.
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", f"ffmpeg.*{rtsp_url}"],
+                check=False, timeout=2,
+            )
+        except Exception:
+            pass
+
+        h, w = int(shape[0]), int(shape[1])
+        fps = int(os.environ.get("GO2_RTSP_PUSH_FPS", "15"))
+        ffmpeg_bin = os.environ.get("GO2_FFMPEG_BIN", "").strip() or shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            # ros2_m1_native's activate_env.sh overwrites PATH to ROS-only dirs,
+            # so a homebrew ffmpeg at /opt/homebrew/bin won't be visible unless
+            # GO2_FFMPEG_BIN is explicitly set by the launcher.
+            for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"):
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    ffmpeg_bin = candidate
+                    break
+        if not ffmpeg_bin:
+            logger.error("ffmpeg not found — set GO2_FFMPEG_BIN or install ffmpeg")
+            return None
+
+        cmd = [
+            ffmpeg_bin, "-loglevel", "warning",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}", "-r", str(fps),
+            "-i", "pipe:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-g", str(fps * 2), "-b:v", "2M",
+            "-f", "rtsp", "-rtsp_transport", "tcp",
+            rtsp_url,
+        ]
+        logger.info(f"Starting RTSP pusher: {' '.join(cmd)}")
+        try:
+            return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        except FileNotFoundError:
+            logger.error(f"ffmpeg not on PATH at {ffmpeg_bin}")
+            return None
 
     def on_data_channel_message(self, _, msg, robot_num):
 
