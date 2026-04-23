@@ -135,20 +135,31 @@ controller_server:
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.25
       yaw_goal_tolerance: 0.25
-    # DWB parameters
+    # RotationShimController wraps DWB — first rotates the robot in
+    # place toward the path heading before handing off to the driving
+    # controller. Quadrupeds like Go2 yaw freely but DWB alone tries to
+    # drive + rotate simultaneously, which fails near doorways
+    # (trajectory samples all collide with frame). The shim eliminates
+    # that "stuck rotating and driving" failure mode. See
+    # https://docs.nav2.org/configuration/packages/configuring-rotation-shim-controller.html
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "dwb_core::DWBLocalPlanner"
+      angular_dist_threshold: 0.785          # 45° — rotate first if heading > this
+      forward_sampling_distance: 0.5         # look this far ahead on path for heading
+      rotate_to_heading_angular_vel: 0.8
+      max_angular_accel: 3.2
+      simulate_ahead_time: 1.0
+      # DWB params — inherited by primary controller
       debug_trajectory_details: True
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 3.0 #changed
+      max_vel_x: 3.0
       max_vel_y: 0.0
-      max_vel_theta: 3.0 #changed
+      max_vel_theta: 3.0
       min_speed_xy: 0.0
-      max_speed_xy: 3.0 #changed
+      max_speed_xy: 3.0
       min_speed_theta: 0.0
-      # Add high threshold velocity for turtlebot 3 issue.
-      # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/issues/75
       acc_lim_x: 2.5
       acc_lim_y: 2.5
       acc_lim_theta: 3.2
@@ -157,20 +168,26 @@ controller_server:
       decel_lim_theta: -3.2
       vx_samples: 20
       vy_samples: 20
-      vtheta_samples: 20
-      sim_time: 1.2 #changed
+      vtheta_samples: 40                     # more angular samples for tight spaces
+      sim_time: 1.5
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.3 #changed 
+      xy_goal_tolerance: 0.3
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      # Critic tuning from community consensus for tight indoor:
+      # BaseObstacle low — avoids "refuses to enter doorway" by not
+      # over-penalising proximity to inflation cost. PathAlign +
+      # GoalAlign halved from default 32/24 → 16/16 to prevent the
+      # over-rotation loop. RotateToGoal stays aggressive so final
+      # yaw-to-goal is crisp.
       BaseObstacle.scale: 0.02
-      PathAlign.scale: 32.0
+      PathAlign.scale: 16.0
       PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 24.0
+      GoalAlign.scale: 16.0
       GoalAlign.forward_point_distance: 0.1
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
@@ -190,7 +207,12 @@ local_costmap:
       width: 6
       height: 6
       resolution: 0.05
-      footprint: "[ [0.360, 0.200], [0.360, -0.200], [-0.450, -0.200], [-0.450, 0.200] ]"
+      # Circle model instead of rectangle — a quadruped yaws freely about
+      # base_link, so re-checking corners at every heading makes Nav2
+      # brittle in doorways. 0.34 m ≈ half-diagonal of 0.30×0.65 footprint
+      # minus a sliver (doorways are 75 cm so 2×0.34=0.68 leaves 3.5 cm
+      # clearance each side — tight but passable).
+      robot_radius: 0.34
       plugins: ["static_layer", "voxel_layer", "inflation_layer"]
 
       static_layer:
@@ -202,6 +224,10 @@ local_costmap:
         enabled: True
         publish_voxel_map: True
         observation_sources: scan
+        # Footprint area always clears to free — kills the "Starting point
+        # in lethal space" class of errors at source. The robot can never
+        # be "in a wall" from its own perspective.
+        footprint_clearing_enabled: true
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -209,14 +235,30 @@ local_costmap:
           marking: True
           data_type: "LaserScan"
           raytrace_max_range: 3.0
-          raytrace_min_range: 0.0
+          # CRITICAL: 0.25 m skip-zone around the lidar so Go2's own body
+          # reflections (legs / head seen by the head-mounted sensor)
+          # don't mark cells right under the footprint as obstacles.
+          raytrace_min_range: 0.25
           obstacle_max_range: 2.5
-          obstacle_min_range: 0.0
+          obstacle_min_range: 0.25
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 1.0
-        inflation_radius: 0.1
+        # inflation_radius is a cost GRADIENT, not a safety barrier —
+        # collision is already prevented by robot_radius in the footprint
+        # check. A large radius + gentle falloff makes the planner PREFER
+        # center-of-room paths but still lets it route through doorways.
+        # scaling_factor 10 was too sharp (created cliffs DWB couldn't
+        # optimize across); 3.0 is the community default for indoor.
+        # Reduced from 0.40 → 0.25. With a noisy persistent_map (single-
+        # cell artifacts sprinkled through free space), 0.40 inflation
+        # caused artifact zones to MERGE into solid barriers completely
+        # blocking the free corridor between rooms — planner returned
+        # "no valid path found" even though start/goal are in free cells.
+        # 0.25 = robot_radius (0.34) - tiny buffer; artifacts only merge
+        # if they're within 0.5m of each other, not 0.8m.
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.25
 
 global_costmap:
   global_costmap:
@@ -233,7 +275,12 @@ global_costmap:
       height: 500
       origin_x: -250.0 
       origin_y: -250.0
-      footprint: "[ [0.360, 0.200], [0.360, -0.200], [-0.450, -0.200], [-0.450, 0.200] ]"
+      # Circle model instead of rectangle — a quadruped yaws freely about
+      # base_link, so re-checking corners at every heading makes Nav2
+      # brittle in doorways. 0.34 m ≈ half-diagonal of 0.30×0.65 footprint
+      # minus a sliver (doorways are 75 cm so 2×0.34=0.68 leaves 3.5 cm
+      # clearance each side — tight but passable).
+      robot_radius: 0.34
       plugins: ["static_layer", "voxel_layer", "inflation_layer"]
 
       static_layer:
@@ -245,6 +292,8 @@ global_costmap:
         enabled: True
         publish_voxel_map: True
         observation_sources: scan
+        # Same reasoning as local_costmap voxel_layer — see that block.
+        footprint_clearing_enabled: true
         scan:
           topic: scan
           max_obstacle_height: 2.0
@@ -252,14 +301,27 @@ global_costmap:
           marking: True
           data_type: "LaserScan"
           raytrace_max_range: 3.0
-          raytrace_min_range: 0.0
+          raytrace_min_range: 0.25
           obstacle_max_range: 2.5
-          obstacle_min_range: 0.0
+          obstacle_min_range: 0.25
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 1.0
-        inflation_radius: 0.1
+        # inflation_radius is a cost GRADIENT, not a safety barrier —
+        # collision is already prevented by robot_radius in the footprint
+        # check. A large radius + gentle falloff makes the planner PREFER
+        # center-of-room paths but still lets it route through doorways.
+        # scaling_factor 10 was too sharp (created cliffs DWB couldn't
+        # optimize across); 3.0 is the community default for indoor.
+        # Reduced from 0.40 → 0.25. With a noisy persistent_map (single-
+        # cell artifacts sprinkled through free space), 0.40 inflation
+        # caused artifact zones to MERGE into solid barriers completely
+        # blocking the free corridor between rooms — planner returned
+        # "no valid path found" even though start/goal are in free cells.
+        # 0.25 = robot_radius (0.34) - tiny buffer; artifacts only merge
+        # if they're within 0.5m of each other, not 0.8m.
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.25
 
 map_server:
   ros__parameters:
@@ -279,39 +341,38 @@ map_saver:
 planner_server:
   ros__parameters:
     planner_plugins: ["GridBased"]
-    use_sim_time: True
+    # Real robot, no /clock publisher — planner must use wall clock or it
+    # stalls forever waiting for ticks that never arrive.
+    use_sim_time: False
 
     GridBased:
-      plugin: "nav2_smac_planner/SmacPlannerHybrid"
-      tolerance: 3.0                            # tolerance for planning if unable to reach exact pose, in meters
-      downsample_costmap: false                 # whether or not to downsample the map
-      downsampling_factor: 1                    # multiplier for the resolution of the costmap layer (e.g. 2 on a 5cm costmap would be 10cm)
-      allow_unknown: false                      # allow traveling in unknown space
-      max_iterations: 1000000                   # maximum total iterations to search for before failing (in case unreachable), set to -1 to disable
-      max_on_approach_iterations: 1000          # maximum number of iterations to attempt to reach goal once in tolerance
-      max_planning_time: 3.5                    # max time in s for planner to plan, smooth, and upsample. Will scale maximum smoothing and upsampling times based on remaining time after planning.
-      motion_model_for_search: "REEDS_SHEPP"    # For Hybrid Dubin, Reeds-Shepp
-      cost_travel_multiplier: 2.0               # For 2D: Cost multiplier to apply to search to steer away from high cost areas. Larger values will place in the center of aisles more exactly (if non-`FREE` cost potential field exists) but take slightly longer to compute. To optimize for speed, a value of 1.0 is reasonable. A reasonable tradeoff value is 2.0. A value of 0.0 effective disables steering away from obstacles and acts like a naive binary search A*.
-      angle_quantization_bins: 64               # For Hybrid nodes: Number of angle bins for search, must be 1 for 2D node (no angle search)
-      analytic_expansion_ratio: 3.5             # For Hybrid/Lattice nodes: The ratio to attempt analytic expansions during search for final approach.
-      analytic_expansion_max_length: 3.0        # For Hybrid/Lattice nodes: The maximum length of the analytic expansion to be considered valid to prevent unsafe shortcutting (in meters). This should be scaled with minimum turning radius and be no less than 4-5x the minimum radius
-      minimum_turning_radius: 0.30              # For Hybrid/Lattice nodes: minimum turning radius in m of path / vehicle
-      reverse_penalty: 2.1                      # For Reeds-Shepp model: penalty to apply if motion is reversing, must be => 1
-      change_penalty: 0.0                       # For Hybrid nodes: penalty to apply if motion is changing directions, must be >= 0
-      non_straight_penalty: 1.20                # For Hybrid nodes: penalty to apply if motion is non-straight, must be => 1
-      cost_penalty: 1.5                         # For Hybrid nodes: penalty to apply to higher cost areas when adding into the obstacle map dynamic programming distance expansion heuristic. This drives the robot more towards the center of passages. A value between 1.3 - 3.5 is reasonable.
-      retrospective_penalty: 0.025              # For Hybrid/Lattice nodes: penalty to prefer later maneuvers before earlier along the path. Saves search time since earlier nodes are not expanded until it is necessary. Must be >= 0.0 and <= 1.0
-      rotation_penalty: 4.0                     # For Lattice node: Penalty to apply only to pure rotate in place commands when using minimum control sets containing rotate in place primitives. This should always be set sufficiently high to weight against this action unless strictly necessary for obstacle avoidance or there may be frequent discontinuities in the plan where it requests the robot to rotate in place to short-cut an otherwise smooth path for marginal path distance savings.
-      lookup_table_size: 20.0                   # For Hybrid nodes: Size of the dubin/reeds-sheep distance window to cache, in meters.
-      cache_obstacle_heuristic: True            # For Hybrid nodes: Cache the obstacle map dynamic programming distance expansion heuristic between subsiquent replannings of the same goal location. Dramatically speeds up replanning performance (40x) if costmap is largely static.  
-      allow_reverse_expansion: False            # For Lattice nodes: Whether to expand state lattice graph in forward primitives or reverse as well, will double the branching factor at each step.   
-      smooth_path: True                         # For Lattice/Hybrid nodes: Whether or not to smooth the path, always true for 2D nodes.
+      # SmacPlanner2D: pure grid A*, ignores kinematic constraints.
+      # The previous SmacPlannerHybrid with motion_model=REEDS_SHEPP was
+      # designed for Ackermann-style cars that cannot turn in place —
+      # combined with minimum_turning_radius=0.30m it refused to produce
+      # plans in our ~75 cm indoor doorways, leaving bt_navigator stuck
+      # in "spin as recovery" loops. Go2 is a quadruped that rotates
+      # freely about base_link, so pure grid A* is both simpler and
+      # strictly more permissive.
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.3                            # reach goal within 30 cm — good enough for home navigation
+      downsample_costmap: false
+      downsampling_factor: 1
+      # Allow planning through unknown space. Go2's voxel window is only
+      # 6.4 m wide; any goal further than that sits in "unknown" from
+      # our perspective, and we need the planner to route through it
+      # rather than refuse.
+      allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      cost_travel_multiplier: 2.0
+      smooth_path: True
       smoother:
         max_iterations: 1000
         w_smooth: 0.3
         w_data: 0.2
         tolerance: 1.0e-10
-        do_refinement: true                     # Whether to recursively run the smoother 3 times on the results from prior runs to refine the results further
     
 behavior_server:
   ros__parameters:
@@ -332,7 +393,8 @@ behavior_server:
     global_frame: odom
     robot_base_frame: base_link
     transform_tolerance: 0.1
-    use_sim_time: true
+    # Real robot, no /clock publisher — same story as planner_server above.
+    use_sim_time: False
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
     min_rotational_vel: 0.4

@@ -511,7 +511,11 @@ class Go2Connection():
                 binary_data = buf[8 + length:]
                 obj = json.loads(json_data.decode('utf-8'))
                 decoded_data = decoder.decode(binary_data, obj['data'])
-                obj['data']['data'] = decoded_data
+                # Populate decoded_data at the top level — the rest of
+                # the pipeline (publish_lidar_webrtc) reads from here.
+                # Previously only obj['data']['data'] was set, causing
+                # a silent KeyError once the driver hit this branch.
+                obj['decoded_data'] = decoded_data
                 return obj
             else:
                 # Normal format

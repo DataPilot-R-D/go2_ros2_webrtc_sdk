@@ -42,7 +42,7 @@ from scripts_go2.webrtc_driver import Go2Connection
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from tf2_ros import TransformBroadcaster, TransformStamped
 from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
@@ -50,7 +50,7 @@ from go2_interfaces.msg import Go2State, IMU, LowState
 from sensor_msgs.msg import PointCloud2, PointField, JointState, Joy
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Empty, Header, String
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Image, CameraInfo
 
 
@@ -100,6 +100,16 @@ class RobotBaseNode(Node):
         # generic battery parser (voltage + percentage + charging).
         self.battery_pub = []
 
+        # Nav2 expects /map on TRANSIENT_LOCAL durability so late subscribers
+        # still get the most recent map after they start up. Without this
+        # the planner stays stuck on "no map received" even though we are
+        # publishing.
+        map_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
         if self.conn_mode == 'single':
             self.joint_pub.append(self.create_publisher(
                 JointState, 'joint_states', qos_profile))
@@ -113,6 +123,11 @@ class RobotBaseNode(Node):
             self.img_pub.append(self.create_publisher(Image, 'camera/image_raw', qos_profile))
             self.camera_info_pub.append(self.create_publisher(CameraInfo, 'camera/camera_info', qos_profile))
             self.battery_pub.append(self.create_publisher(String, 'battery_state', qos_profile))
+            # Publish under /map_uslam first (not /map) to avoid stomping
+            # on persistent_map_publisher's /map while we verify USLAM
+            # actually feeds data. Once empirically confirmed we switch
+            # the topic to /map and remove persistent_map_publisher.
+            self.map_pub = self.create_publisher(OccupancyGrid, 'map_uslam', map_qos)
 
         else:
             for i in range(len(self.robot_ip_lst)):
@@ -277,7 +292,9 @@ class RobotBaseNode(Node):
             try:
                 self.publish_lidar_webrtc()
             except Exception as e:
-                self.get_logger().debug(f"Lidar publish error: {e}")
+                # WARN instead of DEBUG — lidar failures were swallowed
+                # silently, freezing /point_cloud2 → /scan → SLAM forever.
+                self.get_logger().warning(f"Lidar publish error: {e}")
 
     def cmd_vel_cb(self, msg, robot_num):
         x = msg.linear.x
@@ -380,12 +397,73 @@ class RobotBaseNode(Node):
             for topic in RTC_TOPIC.values():
                 dc.send(json.dumps({"type": "subscribe", "topic": topic}))
 
+            # Activate Go2's onboard USLAM so we get the persistent
+            # global map on `rt/mapping/grid_map` + `rt/uslam/cloud_map`.
+            # Empirical sequence reverse-engineered from z4ziggy/z4rtc
+            # and phospho-app/go2_webrtc_connect — the key insight is
+            # that the command topic takes a BARE STRING (not a dict)
+            # and requires two prerequisite toggles first.
+            import time as _t
+
+            # Prereq 1: disable traffic saving. Go2 throttles non-
+            # essential topics by default; with it on, USLAM topics
+            # never reach the data channel even if USLAM runs.
+            dc.send(json.dumps({
+                "type": "rtc_inner_req",
+                "topic": "",
+                "data": {
+                    "req_type": "disable_traffic_saving",
+                    "instruction": "on",
+                },
+            }))
+
+            # Three-step USLAM activation dance that preserves teleop:
+            #   a) motion_switcher(normal) — USLAM only processes client
+            #      commands in `normal` or `mcf`. In `ai`/sport mode
+            #      mapping/start is silently dropped.
+            #   b) Fire mapping/start + run_mapping_process while the
+            #      robot is in `normal`.
+            #   c) motion_switcher(ai) — flip back to AI sport mode so
+            #      our /cmd_vel_teleop chain regains base control.
+            # Empirically USLAM continues publishing its map after step
+            # (c) even though base control is no longer its own. That
+            # lets us teleop while the onboard SLAM keeps mapping.
+
+            def _motion_switcher(name: str) -> None:
+                ms_id = int(_t.time() * 1000) % 2147483647
+                dc.send(json.dumps({
+                    "type": "req",
+                    "topic": "rt/api/motion_switcher/request",
+                    "data": {
+                        "header": {"identity": {"id": ms_id, "api_id": 1002}},
+                        "parameter": json.dumps({"name": name}),
+                    },
+                }))
+
+            _motion_switcher("normal")
+            _t.sleep(0.5)  # let Go2 transition before hitting USLAM
+            # Bare STRING payload — dicts get silently ignored here.
+            for cmd in ("mapping/start", "mapping/run_mapping_process"):
+                dc.send(json.dumps({
+                    "type": "msg",
+                    "topic": RTC_TOPIC["USLAM_CMD"],
+                    "data": cmd,
+                }))
+            _t.sleep(0.5)
+            _motion_switcher("ai")
+            self.get_logger().info(
+                "USLAM activation sequence: normal → mapping/start → "
+                "mapping/run_mapping_process → ai (teleop restored)"
+            )
+
     async def on_video_frame(self, track: MediaStreamTrack, robot_num):
         logger.info(f"Video frame loop starting for robot {robot_num}")
         frame_count = 0
-        rtsp_pusher = None
-        # Sticky flag — once ffmpeg is missing we stop logging it every frame
-        rtsp_disabled = False
+        # Shared ffmpeg pusher lives on self — Go2 fires on_video_frame
+        # multiple times per WebRTC reconnect, and every loop used to
+        # spawn/kill its own ffmpeg, ending up in an SIGKILL ping-pong.
+        if not hasattr(self, "_rtsp_pusher_state"):
+            self._rtsp_pusher_state = {"pusher": None, "disabled": False, "owner": None}
 
         try:
             while True:
@@ -418,44 +496,62 @@ class RobotBaseNode(Node):
                 # go2rtc on localhost. Media Gateway + dashboard then
                 # pick it up as a regular robot_camera stream.
                 rtsp_url = os.environ.get("GO2_RTSP_PUSH_URL", "").strip()
-                if rtsp_url and not rtsp_disabled:
-                    # Dead-process check: ffmpeg frequently exits silently
-                    # after a few minutes when the RTSP server closes the
-                    # TCP session; stdin writes would keep succeeding into
-                    # the kernel buffer, so rely on poll() to detect it.
-                    if rtsp_pusher is not None and rtsp_pusher.poll() is not None:
-                        logger.warning(
-                            f"RTSP pusher exited (code={rtsp_pusher.returncode}) — restarting"
-                        )
-                        rtsp_pusher = None
-                    if rtsp_pusher is None:
-                        rtsp_pusher = self._start_rtsp_pusher(rtsp_url, img.shape)
-                        if rtsp_pusher is None:
-                            # ffmpeg missing — stop trying this frame loop.
-                            rtsp_disabled = True
-                    if rtsp_pusher is not None:
-                        try:
-                            rtsp_pusher.stdin.write(img.tobytes())
-                            rtsp_pusher.stdin.flush()
-                        except (BrokenPipeError, ValueError, OSError):
-                            logger.warning("RTSP pusher pipe broken — restarting")
+                state = self._rtsp_pusher_state
+                if rtsp_url and not state["disabled"]:
+                    # Only one loop owns the pusher. Later loops just
+                    # skip encoding — Go2 sends the same video track to
+                    # every listener anyway, so duplicate encoding is
+                    # wasted CPU and fights over the RTSP session.
+                    owner = state["owner"]
+                    if owner is None or owner == id(track):
+                        state["owner"] = id(track)
+                        pusher = state["pusher"]
+                        if pusher is not None and pusher.poll() is not None:
+                            logger.warning(
+                                f"RTSP pusher exited (code={pusher.returncode}) — restarting"
+                            )
+                            pusher = None
+                        if pusher is None:
+                            pusher = self._start_rtsp_pusher(rtsp_url, img.shape)
+                            if pusher is None:
+                                state["disabled"] = True
+                        state["pusher"] = pusher
+                        if pusher is not None:
                             try:
-                                rtsp_pusher.kill()
-                                rtsp_pusher.wait(timeout=1)
-                            except Exception:
-                                pass
-                            rtsp_pusher = None
+                                pusher.stdin.write(img.tobytes())
+                                pusher.stdin.flush()
+                            except (BrokenPipeError, ValueError, OSError):
+                                logger.warning("RTSP pusher pipe broken — restarting")
+                                try:
+                                    pusher.kill()
+                                    pusher.wait(timeout=1)
+                                except Exception:
+                                    pass
+                                state["pusher"] = None
 
                 await asyncio.sleep(0)
         except Exception as e:
-            logger.error(f"Video frame loop crashed after {frame_count} frames: {e}")
+            import traceback
+            logger.error(
+                f"Video frame loop crashed after {frame_count} frames: "
+                f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+            )
         finally:
-            if rtsp_pusher is not None:
-                try:
-                    rtsp_pusher.stdin.close()
-                    rtsp_pusher.kill()
-                except Exception:
-                    pass
+            state = getattr(self, "_rtsp_pusher_state", None)
+            if state is not None and state.get("owner") == id(track):
+                pusher = state.get("pusher")
+                if pusher is not None:
+                    try:
+                        pusher.stdin.close()
+                        pusher.kill()
+                    except Exception:
+                        pass
+                state["pusher"] = None
+                # Release owner so another loop (Go2 sends two video
+                # tracks, one per encoding) can pick the pusher up.
+                # Without this, once the first-claimed loop dies,
+                # /point_cloud2 + /scan + camera all stay dark.
+                state["owner"] = None
 
     def _wake_up_sequence(self) -> None:
         # RecoveryStand → wait → BalanceStand. Needed after the dog has
@@ -550,6 +646,96 @@ class RobotBaseNode(Node):
         if msg.get('topic') == RTC_TOPIC['LOW_STATE']:
             self.robot_low_cmd[robot_num] = msg
 
+        # Handle Go2's onboard USLAM global map. Payload format is
+        # assumed to mirror nav_msgs/OccupancyGrid serialized as JSON
+        # over the data channel — that's the standard pattern Unitree
+        # uses for their ROS1-style bridge. If the format differs we'll
+        # see it in the diagnostic log on the first few frames and
+        # adapt the decoder.
+        topic = msg.get('topic')
+        if topic == RTC_TOPIC.get("GRID_MAP"):
+            self._on_grid_map(msg)
+        elif topic in (
+            RTC_TOPIC.get("USLAM_CLOUD_MAP"),
+            RTC_TOPIC.get("USLAM_SERVER_LOG"),
+            RTC_TOPIC.get("USLAM_FRONTEND_ODOM"),
+        ):
+            # USLAM status/telemetry channels. server_log in particular
+            # is a goldmine when USLAM doesn't start — error messages
+            # from the mapping subsystem land there.
+            self._inspect_uslam_msg(topic, msg)
+
+    def _inspect_uslam_msg(self, topic: str, msg: dict) -> None:
+        if not hasattr(self, "_uslam_inspect_count"):
+            self._uslam_inspect_count = {}
+        n = self._uslam_inspect_count.get(topic, 0) + 1
+        self._uslam_inspect_count[topic] = n
+        if n <= 3 or n % 100 == 0:
+            data = msg.get("data")
+            if isinstance(data, dict):
+                preview = {
+                    k: (v if not isinstance(v, (list, dict)) else f"{type(v).__name__}(len={len(v)})")
+                    for k, v in data.items()
+                }
+            else:
+                preview = f"type={type(data).__name__}"
+            self.get_logger().info(
+                f"USLAM msg #{n} on {topic}: {preview}"
+            )
+
+    def _on_grid_map(self, msg: dict) -> None:
+        """Decode Go2's persistent grid map and republish as /map.
+
+        Unitree serializes nav_msgs/OccupancyGrid as JSON with the same
+        structure as rosbridge: info.{resolution,width,height,origin},
+        data[]. Robot publishes in the onboard SLAM's map frame — we
+        republish under our TF tree's "map" frame since we run an
+        identity map→odom transform in onboard_slam mode.
+        """
+        # Always log the first frames so we can verify format empirically.
+        self._inspect_uslam_msg(RTC_TOPIC["GRID_MAP"], msg)
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            return
+        try:
+            info = data.get("info", {})
+            grid_data = data.get("data")
+            if grid_data is None or "resolution" not in info:
+                return
+            og = OccupancyGrid()
+            og.header.stamp = self.get_clock().now().to_msg()
+            # Unitree tags this in its own "map" frame; we normalise.
+            og.header.frame_id = "map"
+            og.info.resolution = float(info["resolution"])
+            og.info.width = int(info["width"])
+            og.info.height = int(info["height"])
+            origin = info.get("origin", {})
+            pos = origin.get("position", {})
+            orient = origin.get("orientation", {"w": 1.0})
+            og.info.origin.position.x = float(pos.get("x", 0.0))
+            og.info.origin.position.y = float(pos.get("y", 0.0))
+            og.info.origin.position.z = float(pos.get("z", 0.0))
+            og.info.origin.orientation.x = float(orient.get("x", 0.0))
+            og.info.origin.orientation.y = float(orient.get("y", 0.0))
+            og.info.origin.orientation.z = float(orient.get("z", 0.0))
+            og.info.origin.orientation.w = float(orient.get("w", 1.0))
+            og.data = [int(v) for v in grid_data]
+            self.map_pub.publish(og)
+            if not hasattr(self, "_grid_map_published"):
+                self.get_logger().info(
+                    f"Republished USLAM grid map: {og.info.width}×{og.info.height} "
+                    f"@ {og.info.resolution}m/cell, origin="
+                    f"({og.info.origin.position.x:.2f},{og.info.origin.position.y:.2f})"
+                )
+                self._grid_map_published = True
+        except (KeyError, ValueError, TypeError) as exc:
+            if not hasattr(self, "_grid_map_decode_warned"):
+                self.get_logger().warning(
+                    f"Failed to decode USLAM grid_map payload ({exc}); "
+                    f"first-frame data keys: {list(data.keys())}"
+                )
+                self._grid_map_decode_warned = True
+
     def publish_odom_webrtc(self):
         for i in range(len(self.robot_odom)):
             if self.robot_odom[str(i)]:
@@ -608,13 +794,29 @@ class RobotBaseNode(Node):
                 self.go2_odometry_pub[i].publish(odom_msg)
 
     def publish_lidar_webrtc(self):
+        # Rate-limit the "missing decoded_data" warning so a stream of
+        # malformed frames doesn't flood the log every 0.5s tick.
+        if not hasattr(self, "_lidar_missing_warn_ts"):
+            self._lidar_missing_warn_ts = {}
         for i in range(len(self.robot_lidar)):
             if self.robot_lidar[str(i)]:
+                msg = self.robot_lidar[str(i)]
+                decoded = msg.get("decoded_data")
+                if not decoded:
+                    now_ns = self.get_clock().now().nanoseconds
+                    last = self._lidar_missing_warn_ts.get(str(i), 0)
+                    if now_ns - last > 5_000_000_000:  # 5 s
+                        self.get_logger().warning(
+                            f"Lidar frame {i} missing decoded_data — "
+                            f"skipping publish until next valid frame"
+                        )
+                        self._lidar_missing_warn_ts[str(i)] = now_ns
+                    continue
                 points = update_meshes_for_cloud2(
-                    self.robot_lidar[str(i)]["decoded_data"]["positions"],
-                    self.robot_lidar[str(i)]["decoded_data"]["uvs"],
-                    self.robot_lidar[str(i)]['data']['resolution'],
-                    self.robot_lidar[str(i)]['data']['origin'],
+                    decoded["positions"],
+                    decoded["uvs"],
+                    msg['data']['resolution'],
+                    msg['data']['origin'],
                     0
                 )
                 point_cloud = PointCloud2()

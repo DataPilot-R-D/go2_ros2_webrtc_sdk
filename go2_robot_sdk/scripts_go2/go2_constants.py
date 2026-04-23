@@ -83,6 +83,17 @@ RTC_TOPIC = {
     "BASH_REQ": "rt/api/bashrunner/request",
     "SELF_TEST": "rt/selftest",
     "GRID_MAP": "rt/mapping/grid_map",
+    # USLAM = Unitree's onboard SLAM subsystem. Its command topic accepts
+    # JSON {"cmd": "mapping/start|stop|cancel", ...} and enables the full
+    # persistent map stream on rt/uslam/cloud_map + rt/mapping/grid_map.
+    # Without start, Go2 only publishes the 6.4 m local utlidar window.
+    "USLAM_CMD": "rt/uslam/client_command",
+    "USLAM_CLOUD_MAP": "rt/uslam/cloud_map",
+    # Response + telemetry topics from the USLAM subsystem — subscribing
+    # to these lets us see whether mapping/start was accepted and watch
+    # its progress. server_log is free-form strings from the USLAM node.
+    "USLAM_SERVER_LOG": "rt/uslam/server_log",
+    "USLAM_FRONTEND_ODOM": "rt/uslam/frontend/odom",
     "SERVICE_STATE": "rt/servicestate",
     "GPT_FEEDBACK": "rt/gptflowfeedback",
     "VUI": "rt/api/vui/request",
