@@ -697,6 +697,103 @@ class RobotBaseNode(Node):
 
                 asyncio.get_event_loop().create_task(_probe_download_map())
 
+            # FRESH MAPPING PROBE (with logging): test if mapping/* commands
+            # now work differently when common/enable_logging is sent first.
+            # Full cycle: enable_logging -> get_status -> cancel -> motion(normal)
+            # -> mapping/start -> run_mapping_process -> motion(ai) -> wait STOP
+            # -> motion(normal) -> mapping/stop -> run_mapping_process
+            # -> get_map_file -> download. MD5 compared to prior "dom" map.
+            # Gated by GO2_PROBE_FRESH_MAPPING=1.
+            if os.environ.get("GO2_PROBE_FRESH_MAPPING") == "1":
+                import asyncio
+                conn_ref = self.conn[robot_num]
+                trigger_path = "/tmp/go2-probe/STOP"
+                out_dir = "/tmp/go2-probe"
+
+                async def _fresh_mapping_probe():
+                    os.makedirs(out_dir, exist_ok=True)
+                    try:
+                        os.remove(trigger_path)
+                    except FileNotFoundError:
+                        pass
+
+                    def _cmd(c, label="FRESH"):
+                        self.get_logger().info(f"{label}: >>> {c}")
+                        dc.send(json.dumps({"type": "msg",
+                                            "topic": RTC_TOPIC["USLAM_CMD"], "data": c}))
+
+                    def _ms(name):
+                        ms_id = int(_t.time() * 1000) % 2147483647
+                        self.get_logger().info(f"FRESH: motion_switcher -> '{name}'")
+                        dc.send(json.dumps({
+                            "type": "req",
+                            "topic": "rt/api/motion_switcher/request",
+                            "data": {
+                                "header": {"identity": {"id": ms_id, "api_id": 1002}},
+                                "parameter": json.dumps({"name": name}),
+                            },
+                        }))
+
+                    await asyncio.sleep(4.0)
+                    _cmd("common/enable_logging")
+                    await asyncio.sleep(1.5)
+                    _cmd("mapping/get_status")
+                    await asyncio.sleep(2.0)
+                    _cmd("localization/stop")
+                    await asyncio.sleep(2.0)
+                    _cmd("mapping/cancel")
+                    await asyncio.sleep(2.5)
+                    _ms("normal")
+                    await asyncio.sleep(1.5)
+                    _cmd("mapping/start")
+                    await asyncio.sleep(2.5)
+                    _cmd("mapping/get_status")
+                    await asyncio.sleep(1.5)
+                    _cmd("mapping/run_mapping_process")
+                    await asyncio.sleep(2.5)
+                    _ms("ai")
+                    await asyncio.sleep(1.5)
+
+                    started_at = _t.time()
+                    self.get_logger().info(
+                        f"FRESH: mapping ACTIVE. Teleop the robot around. "
+                        f"When done: touch {trigger_path}")
+                    while not os.path.exists(trigger_path):
+                        await asyncio.sleep(2.0)
+                        elapsed = int(_t.time() - started_at)
+                        if elapsed and elapsed % 15 == 0:
+                            self.get_logger().info(
+                                f"FRESH: {elapsed}s elapsed")
+                    self.get_logger().info("FRESH: STOP trigger -> finalizing")
+
+                    _ms("normal")
+                    await asyncio.sleep(1.5)
+                    _cmd("mapping/stop")
+                    await asyncio.sleep(3.0)
+                    _cmd("mapping/run_mapping_process")
+                    await asyncio.sleep(5.0)
+                    _cmd("common/get_map_file")
+                    await asyncio.sleep(2.0)
+                    for fp in ("map.pcd", "map.pgm", "map.txt"):
+                        try:
+                            b = await conn_ref.download_static_file(fp, timeout=60.0)
+                            out = os.path.join(out_dir, f"fresh_{fp}")
+                            with open(out, "wb") as f:
+                                f.write(b)
+                            self.get_logger().info(
+                                f"FRESH: saved {out} ({len(b)} bytes)")
+                        except Exception as exc:
+                            self.get_logger().error(
+                                f"FRESH: {fp} failed: {exc}")
+                    # Go back to ai so robot stays controllable.
+                    _ms("ai")
+                    try:
+                        os.remove(trigger_path)
+                    except FileNotFoundError:
+                        pass
+
+                asyncio.get_event_loop().create_task(_fresh_mapping_probe())
+
             # MULTI-MAP PROBE: use common/set_map_id to force a fresh slot before
             # starting a new mapping session. Also enables USLAM verbose logging
             # to see server_log responses. Gated by GO2_PROBE_MULTIMAP=N where N
