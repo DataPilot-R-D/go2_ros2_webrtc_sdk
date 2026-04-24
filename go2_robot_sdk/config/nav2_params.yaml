@@ -11,7 +11,9 @@ amcl:
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
     do_beamskip: false
-    global_frame_id: "odom"
+    # 'map' when AMCL is localizing on a static pre-built map (our Nav2
+    # integration path). AMCL publishes map→odom TF in that case.
+    global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
     laser_max_range: 100.0
@@ -42,7 +44,8 @@ amcl:
 bt_navigator:
   ros__parameters:
     use_sim_time: False
-    global_frame: odom
+    # Navigator plans + tracks in map frame (provided by AMCL via TF).
+    global_frame: map
     robot_base_frame: base_link
     odom_topic: odom
     bt_loop_duration: 10
@@ -265,7 +268,9 @@ global_costmap:
     ros__parameters:
       update_frequency: 1.0
       publish_frequency: 1.0
-      global_frame: odom
+      # Global costmap lives in the map frame — static_layer subscribes
+      # to /map from nav2_map_server. Requires AMCL publishing map→odom.
+      global_frame: map
       robot_base_frame: base_link
       use_sim_time: False
       resolution: 0.05
@@ -390,7 +395,9 @@ behavior_server:
       plugin: "nav2_behaviors/Wait"
     assisted_teleop:
       plugin: "nav2_behaviors/AssistedTeleop"
-    global_frame: odom
+    # Behaviors operate in map frame so recovery (backup, spin) reasons
+    # about the localized pose, not raw odom (which drifts over a session).
+    global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 0.1
     # Real robot, no /clock publisher — same story as planner_server above.
