@@ -94,6 +94,8 @@ RTC_TOPIC = {
     # its progress. server_log is free-form strings from the USLAM node.
     "USLAM_SERVER_LOG": "rt/uslam/server_log",
     "USLAM_FRONTEND_ODOM": "rt/uslam/frontend/odom",
+    "USLAM_LOCALIZATION_ODOM": "rt/uslam/localization/odom",
+    "USLAM_NAVIGATION_GLOBAL_PATH": "rt/uslam/navigation/global_path",
     "SERVICE_STATE": "rt/servicestate",
     "GPT_FEEDBACK": "rt/gptflowfeedback",
     "VUI": "rt/api/vui/request",

@@ -440,21 +440,451 @@ class RobotBaseNode(Node):
                     },
                 }))
 
-            _motion_switcher("normal")
-            _t.sleep(0.5)  # let Go2 transition before hitting USLAM
-            # Bare STRING payload — dicts get silently ignored here.
-            for cmd in ("mapping/start", "mapping/run_mapping_process"):
-                dc.send(json.dumps({
-                    "type": "msg",
-                    "topic": RTC_TOPIC["USLAM_CMD"],
-                    "data": cmd,
-                }))
-            _t.sleep(0.5)
-            _motion_switcher("ai")
-            self.get_logger().info(
-                "USLAM activation sequence: normal → mapping/start → "
-                "mapping/run_mapping_process → ai (teleop restored)"
-            )
+            if os.environ.get("GO2_SKIP_USLAM_ACTIVATION") == "1":
+                self.get_logger().info(
+                    "USLAM activation SKIPPED (GO2_SKIP_USLAM_ACTIVATION=1): "
+                    "preserving existing robot state (e.g. Unitree-app-built map + localization)"
+                )
+                # SAFETY: if we skipped the activation dance (which included a
+                # motion_switcher('ai') that keeps the robot in gait mode), the
+                # dog may be in damp mode from a prior disconnect and fall over.
+                # Wake it up: RecoveryStand → BalanceStand forces stable stance.
+                # Disable with GO2_AUTO_WAKE=0.
+                # Note: _wake_up_sequence uses threading which breaks when the
+                # dc.send requires an asyncio event loop. Schedule on loop here.
+                if os.environ.get("GO2_AUTO_WAKE", "1") == "1":
+                    import asyncio as _asyncio
+                    async def _auto_wake():
+                        for cmd_name, delay in (("RecoveryStand", 2.5),
+                                                ("BalanceStand", 0.0)):
+                            try:
+                                self.get_logger().info(
+                                    f"GO2_AUTO_WAKE: sending {cmd_name}")
+                                dc.send(gen_command(ROBOT_CMD[cmd_name]))
+                                if delay:
+                                    await _asyncio.sleep(delay)
+                            except Exception as exc:
+                                self.get_logger().warning(
+                                    f"GO2_AUTO_WAKE {cmd_name}: {exc}")
+                    _asyncio.get_event_loop().create_task(_auto_wake())
+            else:
+                _motion_switcher("normal")
+                _t.sleep(0.5)  # let Go2 transition before hitting USLAM
+                # Bare STRING payload — dicts get silently ignored here.
+                for cmd in ("mapping/start", "mapping/run_mapping_process"):
+                    dc.send(json.dumps({
+                        "type": "msg",
+                        "topic": RTC_TOPIC["USLAM_CMD"],
+                        "data": cmd,
+                    }))
+                _t.sleep(0.5)
+                _motion_switcher("ai")
+                self.get_logger().info(
+                    "USLAM activation sequence: normal → mapping/start → "
+                    "mapping/run_mapping_process → ai (teleop restored)"
+                )
+
+            # PROBE LOCALIZATION + NAVIGATION: comprehensive test of whether
+            # localization/* and navigation/set_goal_pose actually work via
+            # our WebRTC (as opposed to being app-only like mapping/*).
+            # Gated by GO2_PROBE_LOCALIZATION=1. GO2_PROBE_NAV_DELTA_X controls
+            # forward micro-goal distance (default 0.3m).
+            if os.environ.get("GO2_PROBE_LOCALIZATION") == "1":
+                import asyncio
+                conn_ref = self.conn[robot_num]
+                delta_x = float(os.environ.get("GO2_PROBE_NAV_DELTA_X", "0.3"))
+
+                async def _probe_localization():
+                    def _cmd(c):
+                        self.get_logger().info(f"LOC PROBE: >>> {c}")
+                        dc.send(json.dumps({"type": "msg",
+                                            "topic": RTC_TOPIC["USLAM_CMD"], "data": c}))
+
+                    # Wait longer for wake + pose. After reboot, USLAM needs
+                    # a kick to publish frontend/odom.
+                    await asyncio.sleep(8.0)
+                    pose = getattr(self, "_last_frontend_odom_pose", None)
+                    if pose is None:
+                        self.get_logger().warning(
+                            "LOC PROBE: no pose from frontend/odom after 8s — "
+                            "trying localization/start to wake USLAM")
+                        _cmd("localization/start")
+                        await asyncio.sleep(5.0)
+                        pose = getattr(self, "_last_frontend_odom_pose", None)
+                    if pose is None:
+                        pose = getattr(self, "_last_localization_odom_pose", None)
+                        if pose:
+                            self.get_logger().info(
+                                "LOC PROBE: using localization/odom as baseline")
+                    if pose is None:
+                        self.get_logger().error(
+                            "LOC PROBE: STILL no pose — "
+                            "using (0,0,0) and continuing probe anyway")
+                        pose = (0.0, 0.0, 0.0)
+                    x0, y0, yaw0 = pose
+                    self.get_logger().info(
+                        f"LOC PROBE: baseline pose x={x0:.3f} y={y0:.3f} yaw={yaw0:.3f}")
+
+                    # Step 2-3: enable verbose logging + status query.
+                    _cmd("common/enable_logging")
+                    await asyncio.sleep(1.5)
+                    _cmd("localization/get_status")
+                    await asyncio.sleep(3.0)
+
+                    # Step 4: try set_initial_pose_type values 0..3.
+                    for n in (0, 1, 2, 3):
+                        _cmd(f"localization/set_initial_pose_type/{n}")
+                        await asyncio.sleep(3.0)
+
+                    # Step 5: hint at current pose.
+                    _cmd(f"localization/set_initial_pose/{x0}/{y0}/{yaw0}")
+                    await asyncio.sleep(3.0)
+
+                    # Step 6: start localization.
+                    _cmd("localization/start")
+                    await asyncio.sleep(5.0)
+                    _cmd("localization/get_status")
+                    await asyncio.sleep(2.0)
+
+                    # Step 6.5: switch motion mode to 'ai' so sport commands execute.
+                    ms_id = int(_t.time() * 1000) % 2147483647
+                    self.get_logger().info("LOC PROBE: motion_switcher -> 'ai'")
+                    dc.send(json.dumps({
+                        "type": "req",
+                        "topic": "rt/api/motion_switcher/request",
+                        "data": {
+                            "header": {"identity": {"id": ms_id, "api_id": 1002}},
+                            "parameter": json.dumps({"name": "ai"}),
+                        },
+                    }))
+                    await asyncio.sleep(2.0)
+                    # Step 6.7: navigation/start — engage nav engine.
+                    _cmd("navigation/start")
+                    await asyncio.sleep(2.0)
+                    _cmd("navigation/get_status")
+                    await asyncio.sleep(1.5)
+
+                    # Step 7: micro navigation goal.
+                    target_x = x0 + delta_x
+                    target_y = y0
+                    target_yaw = yaw0
+                    _cmd(f"navigation/set_goal_pose/{target_x}/{target_y}/{target_yaw}")
+                    self.get_logger().info(
+                        f"LOC PROBE: goal sent. Watching pose for 30s...")
+                    # Log pose samples over 30s so we see movement (or lack).
+                    for i in range(30):
+                        await asyncio.sleep(1.0)
+                        p = getattr(self, "_last_frontend_odom_pose", None)
+                        loc_p = getattr(self, "_last_localization_odom_pose", None)
+                        if p:
+                            dx = p[0] - x0
+                            dy = p[1] - y0
+                            self.get_logger().info(
+                                f"LOC PROBE: t={i+1}s pose=({p[0]:.3f},{p[1]:.3f},{p[2]:.3f}) "
+                                f"Δ=({dx:+.3f},{dy:+.3f}) "
+                                f"loc_odom={'yes' if loc_p else 'no'}")
+
+                    _cmd("patrol/get_status")
+                    await asyncio.sleep(1.5)
+                    self.get_logger().info("LOC PROBE: done")
+
+                asyncio.get_event_loop().create_task(_probe_localization())
+
+            # PROBE UPLOAD ROUND-TRIP: upload a local .pcd back to the robot,
+            # then download and compare. If Go2 accepts the push, downloads of
+            # map.pcd after will match what we sent. Safe because we upload the
+            # exact file we downloaded (idempotent overwrite).
+            # Gated by GO2_PROBE_UPLOAD_MAP=1. Path: GO2_PROBE_UPLOAD_PATH.
+            if os.environ.get("GO2_PROBE_UPLOAD_MAP") == "1":
+                import asyncio
+                conn_ref = self.conn[robot_num]
+                upload_src = os.environ.get(
+                    "GO2_PROBE_UPLOAD_PATH", "/tmp/go2-probe/dom_map.pcd")
+                target_name = os.environ.get("GO2_PROBE_UPLOAD_TARGET", "map.pcd")
+
+                async def _probe_upload():
+                    await asyncio.sleep(5.0)
+                    try:
+                        with open(upload_src, "rb") as f:
+                            data = f.read()
+                    except Exception as exc:
+                        self.get_logger().error(
+                            f"PROBE UPLOAD: open {upload_src} failed: {exc}")
+                        return
+                    self.get_logger().info(
+                        f"PROBE UPLOAD: sending {upload_src} "
+                        f"({len(data)} bytes) -> robot as {target_name}")
+                    try:
+                        n_chunks = await conn_ref.upload_static_file(
+                            data, target_name)
+                        self.get_logger().info(
+                            f"PROBE UPLOAD: all {n_chunks} chunks sent")
+                    except Exception as exc:
+                        self.get_logger().error(
+                            f"PROBE UPLOAD: send failed: {exc}")
+                        return
+                    # Give robot 3s to commit, then read back.
+                    await asyncio.sleep(3.0)
+                    self.get_logger().info("PROBE UPLOAD: round-trip download")
+                    try:
+                        rt = await conn_ref.download_static_file(
+                            target_name, timeout=60.0)
+                        out = f"/tmp/go2-probe/roundtrip_{target_name}"
+                        os.makedirs("/tmp/go2-probe", exist_ok=True)
+                        with open(out, "wb") as f:
+                            f.write(rt)
+                        self.get_logger().info(
+                            f"PROBE UPLOAD: round-trip -> {out} ({len(rt)} bytes)")
+                    except Exception as exc:
+                        self.get_logger().error(
+                            f"PROBE UPLOAD: round-trip download failed: {exc}")
+
+                asyncio.get_event_loop().create_task(_probe_upload())
+
+            # PROBE READ-ONLY: download the 3 map files via rtc_inner_req
+            # WITHOUT sending any mapping/* commands. Safe on a robot that is
+            # actively localized or patrolling from an app-built map.
+            # Gated by GO2_PROBE_MAP_READONLY=1.
+            if os.environ.get("GO2_PROBE_MAP_READONLY") == "1":
+                import asyncio
+                conn_ref = self.conn[robot_num]
+                async def _probe_readonly():
+                    await asyncio.sleep(5.0)
+                    os.makedirs("/tmp/go2-probe", exist_ok=True)
+                    # Optional: trigger a fresh publish of the served file
+                    # (harmless — does not modify state).
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "common/get_map_file"}))
+                    await asyncio.sleep(1.5)
+                    for fp in ("map.pcd", "map.pgm", "map.txt"):
+                        try:
+                            b = await conn_ref.download_static_file(fp, timeout=60.0)
+                            out = f"/tmp/go2-probe/dom_{fp}"
+                            with open(out, "wb") as f:
+                                f.write(b)
+                            self.get_logger().info(
+                                f"PROBE RO: {out} ({len(b)} bytes)")
+                        except Exception as exc:
+                            self.get_logger().error(f"PROBE RO: {fp} failed: {exc}")
+                asyncio.get_event_loop().create_task(_probe_readonly())
+
+            # PROBE: one-shot map download. mapping/stop → common/get_map_file
+            # → request_static_file. Gated by GO2_PROBE_GET_MAP=1.
+            if os.environ.get("GO2_PROBE_GET_MAP") == "1":
+                import asyncio
+                wait_s = int(os.environ.get("GO2_PROBE_GET_MAP_DELAY", "10"))
+                conn_ref = self.conn[robot_num]
+
+                async def _probe_download_map():
+                    await asyncio.sleep(wait_s)
+                    self.get_logger().info("PROBE: mapping/stop")
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "mapping/stop"}))
+                    await asyncio.sleep(3.0)
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "common/get_map_file"}))
+                    await asyncio.sleep(1.5)
+                    os.makedirs("/tmp/go2-probe", exist_ok=True)
+                    for file_path in ("map.pcd", "map.pgm", "map.txt"):
+                        try:
+                            b = await conn_ref.download_static_file(file_path, timeout=45.0)
+                            out = f"/tmp/go2-probe/{file_path}"
+                            with open(out, "wb") as f:
+                                f.write(b)
+                            self.get_logger().info(f"PROBE: ok {file_path} ({len(b)} bytes)")
+                        except Exception as exc:
+                            self.get_logger().error(f"PROBE: {file_path} failed: {exc}")
+
+                asyncio.get_event_loop().create_task(_probe_download_map())
+
+            # MULTI-MAP PROBE: use common/set_map_id to force a fresh slot before
+            # starting a new mapping session. Also enables USLAM verbose logging
+            # to see server_log responses. Gated by GO2_PROBE_MULTIMAP=N where N
+            # is the new map_id to switch to.
+            if os.environ.get("GO2_PROBE_MULTIMAP"):
+                import asyncio
+                target_map_id = os.environ.get("GO2_PROBE_MULTIMAP", "1")
+                conn_ref = self.conn[robot_num]
+                trigger_path = "/tmp/go2-probe/STOP"
+                out_dir = "/tmp/go2-probe"
+
+                async def _multimap_probe():
+                    os.makedirs(out_dir, exist_ok=True)
+                    try:
+                        os.remove(trigger_path)
+                    except FileNotFoundError:
+                        pass
+
+                    def _cmd(c):
+                        self.get_logger().info(f"MULTIMAP: send '{c}'")
+                        dc.send(json.dumps({"type": "msg",
+                                            "topic": RTC_TOPIC["USLAM_CMD"], "data": c}))
+
+                    # Turn on verbose server_log to see what Go2 actually says.
+                    _cmd("common/enable_logging")
+                    await asyncio.sleep(1.0)
+                    # Diagnostic: current state before any changes.
+                    _cmd("mapping/get_status")
+                    await asyncio.sleep(1.0)
+                    _cmd("common/get_map_id")
+                    await asyncio.sleep(1.5)
+                    # Stop anything in progress cleanly.
+                    _cmd("mapping/cancel")
+                    await asyncio.sleep(1.5)
+                    _cmd("localization/stop")
+                    await asyncio.sleep(1.5)
+                    # THE CRITICAL STEP: switch to a different map_id slot.
+                    _cmd(f"common/set_map_id/{target_map_id}")
+                    await asyncio.sleep(2.0)
+                    # Confirm switch.
+                    _cmd("common/get_map_id")
+                    await asyncio.sleep(1.5)
+                    _cmd("mapping/get_status")
+                    await asyncio.sleep(1.0)
+                    # Start mapping in the (hopefully) new slot.
+                    _cmd("mapping/start")
+                    await asyncio.sleep(2.0)
+                    _cmd("mapping/get_status")
+                    await asyncio.sleep(1.0)
+
+                    started_at = _t.time()
+                    self.get_logger().info(
+                        f"MULTIMAP: session on map_id={target_map_id}. "
+                        f"Teleop the robot. When done: touch {trigger_path}")
+                    while not os.path.exists(trigger_path):
+                        await asyncio.sleep(2.0)
+                        elapsed = int(_t.time() - started_at)
+                        if elapsed and elapsed % 10 == 0:
+                            self.get_logger().info(
+                                f"MULTIMAP: {elapsed}s elapsed on map_id={target_map_id}")
+                    self.get_logger().info("MULTIMAP: STOP → finalizing")
+                    _cmd("mapping/stop")
+                    await asyncio.sleep(3.0)
+                    _cmd("mapping/run_mapping_process")
+                    await asyncio.sleep(5.0)
+                    _cmd("common/get_map_file")
+                    await asyncio.sleep(1.5)
+                    for fp in ("map.pcd", "map.pgm", "map.txt"):
+                        try:
+                            b = await conn_ref.download_static_file(fp, timeout=60.0)
+                            out = os.path.join(out_dir, f"multimap{target_map_id}_{fp}")
+                            with open(out, "wb") as f:
+                                f.write(b)
+                            self.get_logger().info(
+                                f"MULTIMAP: saved {out} ({len(b)} bytes)")
+                        except Exception as exc:
+                            self.get_logger().error(f"MULTIMAP: {fp} failed: {exc}")
+                    try:
+                        os.remove(trigger_path)
+                    except FileNotFoundError:
+                        pass
+
+                asyncio.get_event_loop().create_task(_multimap_probe())
+
+            # MAPPING SESSION: keep mapping active, download when operator says so.
+            # Flow: operator teleops (physical pilot recommended), robot maps continuously,
+            # operator creates /tmp/go2-probe/STOP → driver pulls final map files.
+            # Gated by GO2_MAPPING_SESSION=1.
+            # Optional GO2_MAPPING_RESET_FIRST=1: cycle candidate reset commands
+            # before session start (to force fresh map). Watches server_log for
+            # "receive client command" echo to detect which candidate works.
+            if os.environ.get("GO2_MAPPING_SESSION") == "1":
+                import asyncio
+                conn_ref = self.conn[robot_num]
+                trigger_path = os.environ.get(
+                    "GO2_MAPPING_STOP_TRIGGER", "/tmp/go2-probe/STOP")
+                out_dir = os.environ.get("GO2_MAPPING_OUT_DIR", "/tmp/go2-probe")
+
+                async def _mapping_session():
+                    os.makedirs(out_dir, exist_ok=True)
+                    try:
+                        os.remove(trigger_path)
+                    except FileNotFoundError:
+                        pass
+
+                    # CRITICAL: enable_logging unblocks server_log responses.
+                    # Without it, mapping/* commands look silent but may be rejected.
+                    self.get_logger().info("MAPPING: common/enable_logging")
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "common/enable_logging"}))
+                    await asyncio.sleep(1.5)
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "mapping/get_status"}))
+                    await asyncio.sleep(2.0)
+
+                    if os.environ.get("GO2_MAPPING_RESET_FIRST") == "1":
+                        self.get_logger().info("MAPPING RESET: stopping any in-progress mapping")
+                        dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                            "data": "mapping/stop"}))
+                        await asyncio.sleep(2.0)
+                        reset_candidates = [
+                            "mapping/clear",
+                            "mapping/reset",
+                            "mapping/new_map",
+                            "mapping/delete",
+                            "common/delete_map_file",
+                            "common/clear_map",
+                            "common/reset_map",
+                        ]
+                        for c in reset_candidates:
+                            self.get_logger().info(f"MAPPING RESET: trying '{c}'")
+                            dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                                "data": c}))
+                            await asyncio.sleep(2.5)
+                        self.get_logger().info("MAPPING RESET: re-starting mapping after reset attempts")
+                        dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                            "data": "mapping/start"}))
+                        await asyncio.sleep(1.5)
+                        dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                            "data": "mapping/run_mapping_process"}))
+                        await asyncio.sleep(1.5)
+
+                    started_at = _t.time()
+                    self.get_logger().info(
+                        f"MAPPING: session active. Walk the robot around. "
+                        f"When done: `touch {trigger_path}` to finalize.")
+                    while True:
+                        await asyncio.sleep(2.0)
+                        if os.path.exists(trigger_path):
+                            break
+                        elapsed = int(_t.time() - started_at)
+                        if elapsed % 10 == 0:
+                            self.get_logger().info(
+                                f"MAPPING: {elapsed}s elapsed, still mapping "
+                                f"(touch {trigger_path} to stop)")
+                    self.get_logger().info("MAPPING: STOP trigger detected → finalizing")
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "mapping/stop"}))
+                    await asyncio.sleep(3.0)
+                    # Re-run post-process so Go2 re-commits the current
+                    # accumulated state to the served file (otherwise the
+                    # file stays at whatever was committed on first startup).
+                    self.get_logger().info("MAPPING: mapping/run_mapping_process (re-commit)")
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "mapping/run_mapping_process"}))
+                    await asyncio.sleep(5.0)
+                    dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
+                                        "data": "common/get_map_file"}))
+                    await asyncio.sleep(1.5)
+                    for file_path in ("map.pcd", "map.pgm", "map.txt"):
+                        try:
+                            b = await conn_ref.download_static_file(file_path, timeout=60.0)
+                            out = os.path.join(out_dir, f"final_{file_path}")
+                            with open(out, "wb") as f:
+                                f.write(b)
+                            self.get_logger().info(
+                                f"MAPPING: saved {out} ({len(b)} bytes)")
+                        except Exception as exc:
+                            self.get_logger().error(
+                                f"MAPPING: final_{file_path} failed: {exc}")
+                    try:
+                        os.remove(trigger_path)
+                    except FileNotFoundError:
+                        pass
+                    self.get_logger().info(
+                        f"MAPPING: session done. Files in {out_dir}/final_*.")
+
+                asyncio.get_event_loop().create_task(_mapping_session())
 
     async def on_video_frame(self, track: MediaStreamTrack, robot_num):
         logger.info(f"Video frame loop starting for robot {robot_num}")
@@ -655,15 +1085,42 @@ class RobotBaseNode(Node):
         topic = msg.get('topic')
         if topic == RTC_TOPIC.get("GRID_MAP"):
             self._on_grid_map(msg)
+        elif topic == RTC_TOPIC.get("USLAM_FRONTEND_ODOM"):
+            self._inspect_uslam_msg(topic, msg)
+            self._cache_pose(msg, "_last_frontend_odom_pose")
+        elif topic == RTC_TOPIC.get("USLAM_LOCALIZATION_ODOM"):
+            self._inspect_uslam_msg(topic, msg)
+            self._cache_pose(msg, "_last_localization_odom_pose")
+        elif topic == RTC_TOPIC.get("USLAM_NAVIGATION_GLOBAL_PATH"):
+            self._inspect_uslam_msg(topic, msg)
         elif topic in (
             RTC_TOPIC.get("USLAM_CLOUD_MAP"),
             RTC_TOPIC.get("USLAM_SERVER_LOG"),
-            RTC_TOPIC.get("USLAM_FRONTEND_ODOM"),
         ):
             # USLAM status/telemetry channels. server_log in particular
             # is a goldmine when USLAM doesn't start — error messages
             # from the mapping subsystem land there.
             self._inspect_uslam_msg(topic, msg)
+
+    def _cache_pose(self, msg: dict, attr: str) -> None:
+        """Extract (x, y, yaw) from a PoseWithCovarianceStamped-like msg."""
+        try:
+            data = msg.get("data", {})
+            pose = data.get("pose", {}).get("pose", data.get("pose"))
+            if not isinstance(pose, dict):
+                return
+            p = pose.get("position", {})
+            o = pose.get("orientation", {})
+            x = float(p.get("x", 0.0))
+            y = float(p.get("y", 0.0))
+            # yaw from quaternion (assuming small roll/pitch — typical for floor robot)
+            qz = float(o.get("z", 0.0))
+            qw = float(o.get("w", 1.0))
+            import math
+            yaw = 2 * math.atan2(qz, qw)
+            setattr(self, attr, (x, y, yaw))
+        except Exception:
+            pass
 
     def _inspect_uslam_msg(self, topic: str, msg: dict) -> None:
         if not hasattr(self, "_uslam_inspect_count"):

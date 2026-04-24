@@ -236,6 +236,10 @@ class Go2Connection():
         self.validation_key = ""
         self.heartbeat_timer = None
 
+        # File download (request_static_file) — chunk reassembly keyed by req_uuid.
+        self._file_chunks: dict = {}
+        self._file_futures: dict = {}
+
     def on_connection_state_change(self):
         logger.info(f"Connection state is {self.pc.connectionState}")
 
@@ -351,10 +355,107 @@ class Go2Connection():
     # --- RTC Inner Request (ported from unitree-webrtc-connect/msgs/rtc_inner_req.py) ---
 
     def handle_rtc_inner_req(self, message):
-        """Handle RTT probe requests from robot - echo them back."""
-        info = message.get("info")
-        if info and info.get("req_type") == "rtt_probe_send_from_mechine":
+        """Handle RTT probe + file-download chunk responses."""
+        info = message.get("info") or {}
+        req_type = info.get("req_type")
+        if req_type == "rtt_probe_send_from_mechine":
             self._send_raw("rtc_inner_req", "", info)
+            return
+        # Match request_static_file chunks by req_uuid → collect + resolve future.
+        file_info = info.get("file") or {}
+        req_uuid = info.get("req_uuid")
+        if req_uuid and file_info:
+            if file_info.get("enable_chunking"):
+                idx = file_info.get("chunk_index")
+                total = file_info.get("total_chunk_num")
+                self._file_chunks.setdefault(req_uuid, {})[idx] = file_info.get("data", "")
+                if idx == total:
+                    chunks = self._file_chunks.pop(req_uuid)
+                    merged = "".join(chunks[i] for i in sorted(chunks.keys()))
+                    fut = self._file_futures.pop(req_uuid, None)
+                    if fut and not fut.done():
+                        fut.set_result(merged)
+            elif "data" in file_info:
+                # Single-shot response (small file, not chunked).
+                fut = self._file_futures.pop(req_uuid, None)
+                if fut and not fut.done():
+                    fut.set_result(file_info["data"])
+
+    async def upload_static_file(self, data: bytes, file_path: str,
+                                 related_bussiness: str = "uslam_final_pcd",
+                                 chunk_size: int = 60 * 1024) -> int:
+        """Upload a file to the robot via rtc_inner_req push_static_file.
+
+        Mirrors WebRTCDataChannelFileUploader from unitree_webrtc_connect but
+        uses data_channel.send directly (synchronous, no pub_sub).
+
+        Returns the total number of chunks sent. No explicit confirmation —
+        Go2 commits the file when chunk_index == total_chunk_num arrives.
+        """
+        import base64
+        import uuid as _uuid
+
+        encoded = base64.b64encode(data).decode("utf-8")
+        chunks = [encoded[i:i + chunk_size] for i in range(0, len(encoded), chunk_size)]
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            if i % 5 == 0 and i > 0:
+                await asyncio.sleep(0.2)  # pace every 5 chunks
+            req_uuid = f"upload_req_{_uuid.uuid4().hex[:16]}"
+            message = {
+                "type": "rtc_inner_req",
+                "topic": "",
+                "data": {
+                    "req_type": "push_static_file",
+                    "req_uuid": req_uuid,
+                    "related_bussiness": related_bussiness,
+                    "file_md5": "null",
+                    "file_path": file_path,
+                    "file_size_after_b64": len(encoded),
+                    "file": {
+                        "chunk_index": i + 1,
+                        "total_chunk_num": total,
+                        "chunk_data": chunk,
+                        "chunk_data_size": len(chunk),
+                    },
+                },
+            }
+            self.data_channel.send(json.dumps(message))
+        return total
+
+    async def download_static_file(self, file_path: str,
+                                   related_bussiness: str = "uslam_final_pcd",
+                                   timeout: float = 60.0) -> bytes:
+        """Download a USLAM-owned static file via rtc_inner_req request_static_file.
+
+        Returns raw bytes (base64-decoded). Caller is responsible for sequencing
+        any required preconditions (mapping/stop, common/get_map_file).
+        """
+        import base64
+        import uuid as _uuid
+
+        req_uuid = f"req_{_uuid.uuid4().hex[:16]}"
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._file_futures[req_uuid] = fut
+
+        self._send_raw("rtc_inner_req", "", {
+            "req_type": "request_static_file",
+            "req_uuid": req_uuid,
+            "related_bussiness": related_bussiness,
+            "file_md5": "null",
+            "file_path": file_path,
+        })
+
+        try:
+            b64 = await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._file_futures.pop(req_uuid, None)
+            self._file_chunks.pop(req_uuid, None)
+
+        if not b64:
+            raise ValueError(f"empty response for {file_path}")
+        return base64.b64decode(b64)
 
     # --- Send helpers ---
 
