@@ -119,6 +119,11 @@ class RobotBaseNode(Node):
                 PointCloud2, 'point_cloud2', qos_profile))
             self.go2_odometry_pub.append(
                 self.create_publisher(Odometry, 'odom', qos_profile))
+            # Map-frame pose from USLAM localization (for external planners)
+            if not hasattr(self, 'go2_loc_odom_pub'):
+                self.go2_loc_odom_pub = []
+            self.go2_loc_odom_pub.append(
+                self.create_publisher(Odometry, 'localization/odom', qos_profile))
             self.imu_pub.append(self.create_publisher(IMU, 'imu', qos_profile))
             self.img_pub.append(self.create_publisher(Image, 'camera/image_raw', qos_profile))
             self.camera_info_pub.append(self.create_publisher(CameraInfo, 'camera/camera_info', qos_profile))
@@ -500,30 +505,56 @@ class RobotBaseNode(Node):
                         dc.send(json.dumps({"type": "msg",
                                             "topic": RTC_TOPIC["USLAM_CMD"], "data": c}))
 
-                    # Wait longer for wake + pose. After reboot, USLAM needs
-                    # a kick to publish frontend/odom.
-                    await asyncio.sleep(8.0)
-                    pose = getattr(self, "_last_frontend_odom_pose", None)
-                    if pose is None:
-                        self.get_logger().warning(
-                            "LOC PROBE: no pose from frontend/odom after 8s — "
-                            "trying localization/start to wake USLAM")
-                        _cmd("localization/start")
-                        await asyncio.sleep(5.0)
-                        pose = getattr(self, "_last_frontend_odom_pose", None)
-                    if pose is None:
-                        pose = getattr(self, "_last_localization_odom_pose", None)
-                        if pose:
+                    # Wait for STABLE localization pose (not first frame — which
+                    # might be stale from a previous session). Poll localization/odom
+                    # until 3 consecutive samples are within 10cm of each other.
+                    # Fall back to frontend/odom only if localization never appears.
+                    await asyncio.sleep(3.0)
+                    _cmd("localization/start")  # kick in case it's not running
+                    await asyncio.sleep(2.0)
+
+                    import math as _math
+                    stable_pose = None
+                    last = None
+                    stable_count = 0
+                    max_wait = 30  # 30s to converge
+                    for s in range(max_wait):
+                        await asyncio.sleep(1.0)
+                        p = getattr(self, "_last_localization_odom_pose", None)
+                        if p is None:
+                            if s == 10:
+                                self.get_logger().warning(
+                                    "LOC PROBE: localization/odom silent after 10s, "
+                                    "falling back to frontend/odom")
+                            p = getattr(self, "_last_frontend_odom_pose", None)
+                        if p is None:
+                            continue
+                        if last is not None:
+                            dx = p[0] - last[0]
+                            dy = p[1] - last[1]
+                            dyaw = abs(_math.atan2(_math.sin(p[2]-last[2]),
+                                                  _math.cos(p[2]-last[2])))
+                            if _math.sqrt(dx*dx + dy*dy) < 0.1 and dyaw < 0.1:
+                                stable_count += 1
+                            else:
+                                stable_count = 0
+                        last = p
+                        if stable_count >= 3:
+                            stable_pose = p
                             self.get_logger().info(
-                                "LOC PROBE: using localization/odom as baseline")
-                    if pose is None:
+                                f"LOC PROBE: localization CONVERGED after {s+1}s "
+                                f"x={p[0]:.3f} y={p[1]:.3f} yaw={p[2]:.3f}")
+                            break
+                        if s % 5 == 0 and p:
+                            self.get_logger().info(
+                                f"LOC PROBE: waiting for convergence t={s+1}s "
+                                f"pose=({p[0]:.3f},{p[1]:.3f}) stable_count={stable_count}")
+
+                    if stable_pose is None:
                         self.get_logger().error(
-                            "LOC PROBE: STILL no pose — "
-                            "using (0,0,0) and continuing probe anyway")
-                        pose = (0.0, 0.0, 0.0)
-                    x0, y0, yaw0 = pose
-                    self.get_logger().info(
-                        f"LOC PROBE: baseline pose x={x0:.3f} y={y0:.3f} yaw={yaw0:.3f}")
+                            "LOC PROBE: localization FAILED to converge in 30s — aborting")
+                        return
+                    x0, y0, yaw0 = stable_pose
 
                     # Step 2-3: enable verbose logging + status query.
                     _cmd("common/enable_logging")
@@ -564,15 +595,25 @@ class RobotBaseNode(Node):
                     _cmd("navigation/get_status")
                     await asyncio.sleep(1.5)
 
-                    # Step 7: micro navigation goal.
-                    target_x = x0 + delta_x
-                    target_y = y0
-                    target_yaw = yaw0
+                    # Step 7: navigation goal. Either absolute (GO2_PROBE_NAV_ABS_*)
+                    # or delta from baseline (GO2_PROBE_NAV_DELTA_X).
+                    abs_x = os.environ.get("GO2_PROBE_NAV_ABS_X")
+                    if abs_x is not None:
+                        target_x = float(abs_x)
+                        target_y = float(os.environ.get("GO2_PROBE_NAV_ABS_Y", "0"))
+                        target_yaw = float(os.environ.get("GO2_PROBE_NAV_ABS_YAW", "0"))
+                        self.get_logger().info(
+                            f"LOC PROBE: ABSOLUTE goal ({target_x}, {target_y}, {target_yaw})")
+                    else:
+                        target_x = x0 + delta_x
+                        target_y = y0
+                        target_yaw = yaw0
                     _cmd(f"navigation/set_goal_pose/{target_x}/{target_y}/{target_yaw}")
+                    watch_s = int(os.environ.get("GO2_PROBE_NAV_WATCH_S", "60"))
                     self.get_logger().info(
-                        f"LOC PROBE: goal sent. Watching pose for 30s...")
-                    # Log pose samples over 30s so we see movement (or lack).
-                    for i in range(30):
+                        f"LOC PROBE: goal sent. Watching pose for {watch_s}s...")
+                    # Log pose samples so we see movement (or lack).
+                    for i in range(watch_s):
                         await asyncio.sleep(1.0)
                         p = getattr(self, "_last_frontend_odom_pose", None)
                         loc_p = getattr(self, "_last_localization_odom_pose", None)
@@ -1188,6 +1229,7 @@ class RobotBaseNode(Node):
         elif topic == RTC_TOPIC.get("USLAM_LOCALIZATION_ODOM"):
             self._inspect_uslam_msg(topic, msg)
             self._cache_pose(msg, "_last_localization_odom_pose")
+            self._republish_localization_odom(msg)
         elif topic == RTC_TOPIC.get("USLAM_NAVIGATION_GLOBAL_PATH"):
             self._inspect_uslam_msg(topic, msg)
         elif topic in (
@@ -1198,6 +1240,44 @@ class RobotBaseNode(Node):
             # is a goldmine when USLAM doesn't start — error messages
             # from the mapping subsystem land there.
             self._inspect_uslam_msg(topic, msg)
+
+    def _republish_localization_odom(self, msg: dict) -> None:
+        """Re-emit USLAM localization pose as a native ROS2 /localization/odom topic.
+
+        Needed because the raw WebRTC message lives only on the data channel.
+        External planners (Nav2 etc) subscribe via rosbridge to this ROS2 topic.
+        """
+        if not hasattr(self, 'go2_loc_odom_pub') or not self.go2_loc_odom_pub:
+            return
+        try:
+            data = msg.get("data", {})
+            pose_wrap = data.get("pose", {})
+            pose_inner = pose_wrap.get("pose", {})
+            pos = pose_inner.get("position", {})
+            ori = pose_inner.get("orientation", {})
+            twist_wrap = data.get("twist", {})
+            twist_inner = twist_wrap.get("twist", {})
+            lin = twist_inner.get("linear", {})
+            ang = twist_inner.get("angular", {})
+            om = Odometry()
+            om.header.stamp = self.get_clock().now().to_msg()
+            om.header.frame_id = "map"
+            om.child_frame_id = "base_link"
+            om.pose.pose.position.x = float(pos.get("x", 0.0))
+            om.pose.pose.position.y = float(pos.get("y", 0.0))
+            om.pose.pose.position.z = float(pos.get("z", 0.0))
+            om.pose.pose.orientation.x = float(ori.get("x", 0.0))
+            om.pose.pose.orientation.y = float(ori.get("y", 0.0))
+            om.pose.pose.orientation.z = float(ori.get("z", 0.0))
+            om.pose.pose.orientation.w = float(ori.get("w", 1.0))
+            om.twist.twist.linear.x = float(lin.get("x", 0.0))
+            om.twist.twist.linear.y = float(lin.get("y", 0.0))
+            om.twist.twist.angular.z = float(ang.get("z", 0.0))
+            self.go2_loc_odom_pub[0].publish(om)
+        except Exception as exc:
+            if not hasattr(self, '_loc_odom_pub_warn'):
+                self._loc_odom_pub_warn = True
+                self.get_logger().warning(f"loc_odom republish failed: {exc}")
 
     def _cache_pose(self, msg: dict, attr: str) -> None:
         """Extract (x, y, yaw) from a PoseWithCovarianceStamped-like msg."""
