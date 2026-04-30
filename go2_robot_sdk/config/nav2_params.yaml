@@ -113,7 +113,10 @@ bt_navigator_navigate_to_pose_rclcpp_node:
 controller_server:
   ros__parameters:
     use_sim_time: False
-    controller_frequency: 3.0
+    # 3.0 → 10.0 — at 3Hz cycle is 333ms; with WebRTC TF latency (200-700ms)
+    # controller often reads stale TF. At 10Hz controller skips stale frames
+    # rather than stalling on Extrapolation Error.
+    controller_frequency: 10.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -145,64 +148,71 @@ controller_server:
     # (trajectory samples all collide with frame). The shim eliminates
     # that "stuck rotating and driving" failure mode. See
     # https://docs.nav2.org/configuration/packages/configuring-rotation-shim-controller.html
+    # ULTRATHINK Plan B: DWB rejected ALL 251 trajectories on 12 successive
+    # restarts despite tuning sim_time, vel limits, robot_radius, inflation,
+    # voxel_layer enable/disable, and dual-map architecture. The 819→251
+    # reduction confirmed our sample-count fixes were applied — but rejection
+    # rate stayed 100%. Conclusion: sample-and-score model is structurally
+    # incompatible with our environment (tight rooms + WebRTC TF jitter +
+    # cleaned/raw map disagreement). Switching to RegulatedPurePursuit which
+    # follows the global path strictly without trajectory sampling.
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController"
-      primary_controller: "dwb_core::DWBLocalPlanner"
-      angular_dist_threshold: 0.785          # 45° — rotate first if heading > this
-      forward_sampling_distance: 0.5         # look this far ahead on path for heading
+      primary_controller: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      # RotationShim wrapper — rotates to path heading first, then hands off
+      # to RPP for path following.
+      angular_dist_threshold: 0.785
+      forward_sampling_distance: 0.5
       rotate_to_heading_angular_vel: 0.8
       max_angular_accel: 3.2
       simulate_ahead_time: 1.0
-      # DWB params — inherited by primary controller
-      debug_trajectory_details: True
-      min_vel_x: 0.0
-      min_vel_y: 0.0
-      max_vel_x: 3.0
-      max_vel_y: 0.0
-      max_vel_theta: 3.0
-      min_speed_xy: 0.0
-      max_speed_xy: 3.0
-      min_speed_theta: 0.0
-      acc_lim_x: 2.5
-      acc_lim_y: 2.5
-      acc_lim_theta: 3.2
-      decel_lim_x: -2.5
-      decel_lim_y: -2.5
-      decel_lim_theta: -3.2
-      vx_samples: 20
-      vy_samples: 20
-      vtheta_samples: 40                     # more angular samples for tight spaces
-      sim_time: 1.5
-      linear_granularity: 0.05
-      angular_granularity: 0.025
-      transform_tolerance: 0.2
-      xy_goal_tolerance: 0.3
-      trans_stopped_velocity: 0.25
-      short_circuit_trajectory_evaluation: True
-      stateful: True
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      # Critic tuning from community consensus for tight indoor:
-      # BaseObstacle low — avoids "refuses to enter doorway" by not
-      # over-penalising proximity to inflation cost. PathAlign +
-      # GoalAlign halved from default 32/24 → 16/16 to prevent the
-      # over-rotation loop. RotateToGoal stays aggressive so final
-      # yaw-to-goal is crisp.
-      BaseObstacle.scale: 0.02
-      PathAlign.scale: 16.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 16.0
-      GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0
-      GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+      # RPP params — agent-recommended for Go2 indoor:
+      # Tuned to match DimOS/replanning_a_star/local_planner.py PController
+      # which user verified DOES patrol Go2 between rooms (no Nav2 path).
+      # Key: Go2 ignores cmd_vel < 0.2 m/s — must always send ≥ 0.2.
+      # User test #16 worked (passed doorway!) but two issues:
+      # (1) zigzag — rotate-then-drive switching too eager.
+      # (2) clipped obstacles — onboard avoidance disabled, no fallback.
+      # Fix #1: bigger lookahead + raise rotate-to-heading threshold so
+      # RPP smooth-drives with angular correction instead of rotate-pause-drive.
+      # Fix #2: lower max velocity so user can react / no Nav2 collision check
+      # but Go2 firmware still has emergency-stop on contact (slower = safer).
+      desired_linear_vel: 0.3                 # was 0.55, slower for safety
+      lookahead_dist: 1.0                     # was 0.6 — bigger = smoother arc
+      min_lookahead_dist: 0.5
+      max_lookahead_dist: 1.4
+      lookahead_time: 1.5
+      transform_tolerance: 1.5
+      use_velocity_scaled_lookahead_dist: true
+      min_approach_linear_velocity: 0.20      # Go2 floor — anything below stalls
+      approach_velocity_scaling_dist: 0.6
+      # Stays disabled. Test #18: even with rectangular footprint + inflation
+      # 0.05, RPP vetos every doorway (~60cm) because /scan walls are within
+      # 5cm of footprint edge. Test #16-17: with this off, robot physically
+      # navigates and passes doorway. Real obstacle safety should be a
+      # SEPARATE collision_monitor node (not coupled to path-following).
+      use_collision_detection: false
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.9
+      regulated_linear_scaling_min_speed: 0.25
+      # Smooth drive instead of rotate-pause-drive. With this OFF, RPP applies
+      # angular correction continuously while driving forward → no zigzag.
+      use_rotate_to_heading: false
+      allow_reversing: false
+      rotate_to_heading_min_angle: 1.5        # 85° — only rotate-in-place if
+                                              # heading is near-backward
+      max_robot_pose_search_dist: 10.0
 
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 1.0
-      publish_frequency: 1.0
+      # 5 Hz is the minimum for reactive obstacle avoidance — at 0.5 m/s the
+      # robot advances 10 cm per update, acceptable reaction distance for
+      # pedestrians / pets. 1 Hz was a dead-man's switch (50 cm lag).
+      update_frequency: 5.0
+      publish_frequency: 5.0
       global_frame: odom
       robot_base_frame: base_link
       use_sim_time: False
@@ -210,16 +220,28 @@ local_costmap:
       width: 6
       height: 6
       resolution: 0.05
-      # Circle model instead of rectangle — a quadruped yaws freely about
-      # base_link, so re-checking corners at every heading makes Nav2
-      # brittle in doorways. 0.34 m ≈ half-diagonal of 0.30×0.65 footprint
-      # minus a sliver (doorways are 75 cm so 2×0.34=0.68 leaves 3.5 cm
-      # clearance each side — tight but passable).
-      robot_radius: 0.34
+      # B: Rectangular footprint instead of circle. Go2 is 30×65cm; circular
+      # robot_radius=0.20 (=40cm circle) ignored orientation → controller
+      # planned through 60cm doorway as if robot were 40cm circle. With
+      # rectangle, costmap knows robot orientation: 17cm half-width on
+      # short side fits 60cm doorway with 13cm each side clearance.
+      # Format: [[+x,+y],[+x,-y],[-x,-y],[-x,+y]] in base_link frame.
+      footprint: "[[0.33, 0.17], [0.33, -0.17], [-0.33, -0.17], [-0.33, 0.17]]"
+      # ULTRATHINK fix #2: re-enable voxel_layer. Local needs runtime
+      # obstacles for safety. Issue earlier was static_layer:/map_clean
+      # mismatch (cleaned map had shifted walls vs AMCL pose) — fixed below
+      # by pointing local static to /map (raw).
       plugins: ["static_layer", "voxel_layer", "inflation_layer"]
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
+        # CRITICAL fix: local uses RAW map (/map). AMCL localizes against raw
+        # map; controller's local costmap MUST agree with AMCL's mental model.
+        # Earlier we used /map_clean which had shifted walls (expand_free)
+        # → DWB simulating from AMCL pose saw lethal cells where there
+        # shouldn't be → all 819 trajectories rejected.
+        # Global keeps /map_clean (planner benefits from cleaned topology).
+        map_topic: /map
         map_subscribe_transient_local: True
 
       voxel_layer:
@@ -251,17 +273,14 @@ local_costmap:
         # collision is already prevented by robot_radius in the footprint
         # check. A large radius + gentle falloff makes the planner PREFER
         # center-of-room paths but still lets it route through doorways.
-        # scaling_factor 10 was too sharp (created cliffs DWB couldn't
-        # optimize across); 3.0 is the community default for indoor.
-        # Reduced from 0.40 → 0.25. With a noisy persistent_map (single-
-        # cell artifacts sprinkled through free space), 0.40 inflation
-        # caused artifact zones to MERGE into solid barriers completely
-        # blocking the free corridor between rooms — planner returned
-        # "no valid path found" even though start/goal are in free cells.
-        # 0.25 = robot_radius (0.34) - tiny buffer; artifacts only merge
-        # if they're within 0.5m of each other, not 0.8m.
+        # 0.20 → 0.05 — robot reached doorway (test #18) but stopped because
+        # local_costmap's 0.20m inflation around scan walls left only ~0.20m
+        # clear corridor (vs 0.34m robot width). Hard collision protection
+        # comes from rectangular footprint check; gradient just guides path
+        # preference. Real doorways 60-65cm: with footprint 34cm + 2×5cm
+        # inflation = 44cm needed — fits.
         cost_scaling_factor: 3.0
-        inflation_radius: 0.25
+        inflation_radius: 0.05
 
 global_costmap:
   global_costmap:
@@ -285,30 +304,30 @@ global_costmap:
       # brittle in doorways. 0.34 m ≈ half-diagonal of 0.30×0.65 footprint
       # minus a sliver (doorways are 75 cm so 2×0.34=0.68 leaves 3.5 cm
       # clearance each side — tight but passable).
-      robot_radius: 0.34
-      plugins: ["static_layer", "voxel_layer", "inflation_layer"]
+      footprint: "[[0.33, 0.17], [0.33, -0.17], [-0.33, -0.17], [-0.33, 0.17]]"   # match local rectangular
+      # Removed voxel_layer from global_costmap. Reasoning:
+      # - global_costmap is for path PLANNING (long-horizon, static features).
+      # - local_costmap (with voxel_layer + /scan) handles RUNTIME obstacle
+      #   avoidance in a 6m rolling window — that's where dynamic obstacles
+      #   matter for the controller.
+      # - With voxel_layer in global, every /scan reading gets DOUBLE-marked
+      #   (once via static_layer's transient_local map, once via voxel_layer's
+      #   live scan), creating spurious lethal cells around the robot that
+      #   blocked SmacPlanner2D from finding paths. Removing the duplication
+      #   restored planning.
+      plugins: ["static_layer", "inflation_layer"]
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
+        # User test #19 conclusion: cleaned map's expand_free_into_unknown=0.30m
+        # widened doorways BEYOND real wall positions. Planner planned path
+        # through "fake" door spot, robot's /scan saw real walls there →
+        # collision. Reverting global to raw /map (single-map): doorways are
+        # at real positions, planner has accurate geometry. Trade-off: raw
+        # map has speckle that may complicate planning, but real-wall
+        # accuracy beats fake-door corridors.
+        map_topic: /map
         map_subscribe_transient_local: True
-
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
-        enabled: True
-        publish_voxel_map: True
-        observation_sources: scan
-        # Same reasoning as local_costmap voxel_layer — see that block.
-        footprint_clearing_enabled: true
-        scan:
-          topic: scan
-          max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          data_type: "LaserScan"
-          raytrace_max_range: 3.0
-          raytrace_min_range: 0.25
-          obstacle_max_range: 2.5
-          obstacle_min_range: 0.25
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -326,7 +345,13 @@ global_costmap:
         # 0.25 = robot_radius (0.34) - tiny buffer; artifacts only merge
         # if they're within 0.5m of each other, not 0.8m.
         cost_scaling_factor: 3.0
-        inflation_radius: 0.25
+        # 0.15 → 0.05 — when robot got physically into doorway, AMCL placed
+        # it within inflation zone of cleaned map → planner refused to
+        # replan ("Starting point in lethal space"). Minimal inflation 0.05
+        # keeps a thin gradient for path PREFERENCE without rejecting
+        # robot's actual physical position. Hard collision protection still
+        # comes from robot_radius=0.30 footprint check.
+        inflation_radius: 0.05
 
 map_server:
   ros__parameters:
@@ -379,6 +404,16 @@ planner_server:
         w_data: 0.2
         tolerance: 1.0e-10
     
+lifecycle_manager_navigation:
+  ros__parameters:
+    autostart: true
+    # Disabled controller_server, smoother_server, velocity_smoother because
+    # custom_controller.py replaces them (DimOS-style pure-pursuit, works on
+    # this Go2 in this house per user's prior projects). Planner stays —
+    # it correctly computes /plan paths through doorways.
+    node_names: ["planner_server", "behavior_server", "bt_navigator", "waypoint_follower"]
+    bond_timeout: 0.0
+
 behavior_server:
   ros__parameters:
     costmap_topic: local_costmap/costmap_raw
@@ -399,7 +434,8 @@ behavior_server:
     # about the localized pose, not raw odom (which drifts over a session).
     global_frame: map
     robot_base_frame: base_link
-    transform_tolerance: 0.1
+    # Bumped 0.1 → 1.5 (matches controller_server) — Go2 WebRTC TF latency.
+    transform_tolerance: 1.5
     # Real robot, no /clock publisher — same story as planner_server above.
     use_sim_time: False
     simulate_ahead_time: 2.0

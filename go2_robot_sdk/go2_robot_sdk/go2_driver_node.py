@@ -471,6 +471,32 @@ class RobotBaseNode(Node):
                             except Exception as exc:
                                 self.get_logger().warning(
                                     f"GO2_AUTO_WAKE {cmd_name}: {exc}")
+                        # ULTRATHINK fix #A: Disable Go2 onboard obstacle
+                        # avoidance. Default-ON behavior overrides external
+                        # cmd_vel near walls (~20-30cm) → Nav2 controller's
+                        # commands silently ignored, robot rocks back/forth
+                        # at narrow doorways. This is exactly what blocked
+                        # us in retries #1-15 even after disabling Nav2's
+                        # own collision detection. Set via api_id=1001
+                        # (Switch) on rt/api/obstacles_avoid/request topic.
+                        # Disable with GO2_DISABLE_OBSTACLE_AVOID=0.
+                        if os.environ.get("GO2_DISABLE_OBSTACLE_AVOID", "1") == "1":
+                            try:
+                                oa_id = int(_t.time() * 1000) % 2147483647
+                                dc.send(json.dumps({
+                                    "type": "req",
+                                    "topic": "rt/api/obstacles_avoid/request",
+                                    "data": {
+                                        "header": {"identity": {"id": oa_id, "api_id": 1001}},
+                                        "parameter": json.dumps({"enable": False}),
+                                    },
+                                }))
+                                self.get_logger().info(
+                                    "GO2_DISABLE_OBSTACLE_AVOID: sent disable "
+                                    "(api_id=1001 obstacles_avoid switch off)")
+                            except Exception as exc:
+                                self.get_logger().warning(
+                                    f"GO2_DISABLE_OBSTACLE_AVOID failed: {exc}")
                     _asyncio.get_event_loop().create_task(_auto_wake())
             else:
                 _motion_switcher("normal")
