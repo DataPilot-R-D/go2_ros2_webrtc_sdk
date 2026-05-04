@@ -392,6 +392,9 @@ planner_server:
       # 6.4 m wide; any goal further than that sits in "unknown" from
       # our perspective, and we need the planner to route through it
       # rather than refuse.
+      # Sprint 1B Test 2 (raw map bez auto-clean): raw mapy mają unknown
+      # cells dokładnie przy framugach drzwi — bez allow_unknown=true planner
+      # odmawia planowania ścieżki przez te przejścia. Default false → blocking.
       allow_unknown: true
       max_iterations: 1000000
       max_on_approach_iterations: 1000
