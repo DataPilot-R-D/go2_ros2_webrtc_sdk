@@ -239,8 +239,8 @@ local_costmap:
         # map; controller's local costmap MUST agree with AMCL's mental model.
         # Earlier we used /map_clean which had shifted walls (expand_free)
         # → DWB simulating from AMCL pose saw lethal cells where there
-        # shouldn't be → all 819 trajectories rejected.
-        # Global keeps /map_clean (planner benefits from cleaned topology).
+        # shouldn't be → all 819 trajectories rejected. Keep local on raw /map
+        # so live scan, AMCL, and static wall geometry all agree.
         map_topic: /map
         map_subscribe_transient_local: True
 
@@ -331,27 +331,13 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # inflation_radius is a cost GRADIENT, not a safety barrier —
-        # collision is already prevented by robot_radius in the footprint
-        # check. A large radius + gentle falloff makes the planner PREFER
-        # center-of-room paths but still lets it route through doorways.
-        # scaling_factor 10 was too sharp (created cliffs DWB couldn't
-        # optimize across); 3.0 is the community default for indoor.
-        # Reduced from 0.40 → 0.25. With a noisy persistent_map (single-
-        # cell artifacts sprinkled through free space), 0.40 inflation
-        # caused artifact zones to MERGE into solid barriers completely
-        # blocking the free corridor between rooms — planner returned
-        # "no valid path found" even though start/goal are in free cells.
-        # 0.25 = robot_radius (0.34) - tiny buffer; artifacts only merge
-        # if they're within 0.5m of each other, not 0.8m.
-        cost_scaling_factor: 3.0
-        # 0.15 → 0.05 — when robot got physically into doorway, AMCL placed
-        # it within inflation zone of cleaned map → planner refused to
-        # replan ("Starting point in lethal space"). Minimal inflation 0.05
-        # keeps a thin gradient for path PREFERENCE without rejecting
-        # robot's actual physical position. Hard collision protection still
-        # comes from robot_radius=0.30 footprint check.
-        inflation_radius: 0.05
+        # Plan-only test 2026-05-04: with inflation_radius=0.05 and smoothing
+        # enabled, Smac produced a nominally legal path with only 0.14 m raw-map
+        # centerline clearance near (0.75, -1.26). Go2 half-width is ~0.17 m,
+        # so that plan physically scrapes walls. 0.22 m keeps a 5 cm margin
+        # over half-width while still fitting through 70 cm doors when centered.
+        cost_scaling_factor: 2.0
+        inflation_radius: 0.22
 
 map_server:
   ros__parameters:
@@ -399,8 +385,12 @@ planner_server:
       max_iterations: 1000000
       max_on_approach_iterations: 1000
       max_planning_time: 2.0
-      cost_travel_multiplier: 2.0
-      smooth_path: True
+      # Treat inflated raw-map costs as important. Low values allowed shorter
+      # routes that hugged walls; plan-only clearance gate requires >=0.22 m.
+      cost_travel_multiplier: 8.0
+      # Smac smoothing can cut corners after A*, reducing wall clearance. Keep
+      # grid path geometry for the external pure-pursuit controller.
+      smooth_path: False
       smoother:
         max_iterations: 1000
         w_smooth: 0.3
