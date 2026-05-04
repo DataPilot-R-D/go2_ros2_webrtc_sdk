@@ -72,6 +72,7 @@ class CustomPurePursuit(Node):
         self.declare_parameter("speed", 0.35)            # max forward m/s
         self.declare_parameter("min_linear", 0.2)        # Go2 cmd_vel floor
         self.declare_parameter("min_angular", 0.2)
+        self.declare_parameter("max_angular", 0.35)
         self.declare_parameter("k_angular", 0.5)         # P-gain on yaw
         self.declare_parameter("lookahead", 0.5)         # m ahead on path
         self.declare_parameter("xy_tolerance", 0.25)
@@ -98,6 +99,7 @@ class CustomPurePursuit(Node):
         self.speed = self.get_parameter("speed").value
         self.min_linear = self.get_parameter("min_linear").value
         self.min_angular = self.get_parameter("min_angular").value
+        self.max_angular = self.get_parameter("max_angular").value
         self.k_angular = self.get_parameter("k_angular").value
         self.lookahead = self.get_parameter("lookahead").value
         self.xy_tol = self.get_parameter("xy_tolerance").value
@@ -150,7 +152,9 @@ class CustomPurePursuit(Node):
 
         self.timer = self.create_timer(1.0 / self.control_hz, self.tick)
         self.get_logger().info(
-            f"custom_pure_pursuit up — speed={self.speed} lookahead={self.lookahead}"
+            "custom_pure_pursuit up — "
+            f"speed={self.speed} lookahead={self.lookahead} "
+            f"max_angular={self.max_angular}"
         )
 
     # ---------- callbacks ----------
@@ -314,6 +318,7 @@ class CustomPurePursuit(Node):
         direction = target - pose.xy()
         desired_yaw = math.atan2(direction[1], direction[0])
         yaw_err = angle_diff(desired_yaw, pose.yaw)
+        cross_track = float(np.min(np.linalg.norm(self.path - pose.xy(), axis=1)))
 
         if abs(yaw_err) > self.rotate_threshold:
             self.publish(0.0, self.angular_with_floor(yaw_err))
@@ -324,8 +329,17 @@ class CustomPurePursuit(Node):
         v = min(self.speed * scale, dist_to_goal)
         v = max(v, self.min_linear)
         w = self.k_angular * yaw_err
-        w = float(np.clip(w, -self.speed, self.speed))
+        w = float(np.clip(w, -self.max_angular, self.max_angular))
         # Don't apply min_angular when rolling forward — lets robot drive straight
+        if now - self._last_diag_log > 1.0:
+            self._last_diag_log = now
+            self.get_logger().info(
+                "tracking "
+                f"pose=({pose.x:.2f},{pose.y:.2f},{pose.yaw:.2f}) "
+                f"target=({target[0]:.2f},{target[1]:.2f}) "
+                f"cross_track={cross_track:.2f} yaw_err={yaw_err:.2f} "
+                f"cmd=({v:.2f},{w:.2f})"
+            )
         self.publish(v, w)
 
     def do_final_rotation(self, pose: Pose2D) -> None:
@@ -353,7 +367,7 @@ class CustomPurePursuit(Node):
 
     def angular_with_floor(self, err: float) -> float:
         w = self.k_angular * err
-        w = float(np.clip(w, -self.speed, self.speed))
+        w = float(np.clip(w, -self.max_angular, self.max_angular))
         if 0 < abs(w) < self.min_angular:
             w = math.copysign(self.min_angular, w)
         return w
