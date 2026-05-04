@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Path
+from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
@@ -88,6 +88,11 @@ class CustomPurePursuit(Node):
         # corridors. 15° forward only catches what's directly in robot's path.
         self.declare_parameter("safety_cone_deg", 15.0)
         self.declare_parameter("safety_enable", True)
+        # Validate each global /plan against the raw static map before any
+        # cmd_vel is emitted. 0.22 m ~= Go2 half-width (0.17 m) + 5 cm margin:
+        # narrow enough for a 70 cm doorway, but blocks plans hugging walls.
+        self.declare_parameter("path_safety_enable", True)
+        self.declare_parameter("path_min_clearance", 0.22)
         self.declare_parameter("stall_timeout_s", 5.0)
 
         self.speed = self.get_parameter("speed").value
@@ -104,6 +109,8 @@ class CustomPurePursuit(Node):
         self.safety_range = self.get_parameter("safety_min_range").value
         self.safety_cone = math.radians(self.get_parameter("safety_cone_deg").value)
         self.safety_enable = self.get_parameter("safety_enable").value
+        self.path_safety_enable = self.get_parameter("path_safety_enable").value
+        self.path_min_clearance = self.get_parameter("path_min_clearance").value
         self.stall_timeout = self.get_parameter("stall_timeout_s").value
 
         # TF
@@ -117,6 +124,11 @@ class CustomPurePursuit(Node):
         self.last_progress_time: float = 0.0
         self.last_progress_dist: float = float("inf")
         self.scan_blocked: bool = False
+        self.map_resolution: Optional[float] = None
+        self.map_origin: Optional[tuple[float, float]] = None
+        self.map_size: Optional[tuple[int, int]] = None
+        self.occupied_cells: Optional[np.ndarray] = None
+        self._last_diag_log: float = 0.0
 
         # IO. Nav2 planner_server publishes /plan as VOLATILE+RELIABLE+depth=1
         # (default sensor-data style). TRANSIENT_LOCAL on subscriber side
@@ -127,6 +139,12 @@ class CustomPurePursuit(Node):
             durability=QoSDurabilityPolicy.VOLATILE,
         )
         self.create_subscription(Path, "/plan", self.on_plan, plan_qos)
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(OccupancyGrid, "/map", self.on_map, map_qos)
         self.create_subscription(LaserScan, "/scan", self.on_scan, 10)
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
@@ -141,6 +159,10 @@ class CustomPurePursuit(Node):
             self.get_logger().warn("empty /plan received — ignoring")
             return
         pts = np.array([[p.pose.position.x, p.pose.position.y] for p in msg.poses])
+        if self.path_safety_enable and not self.path_has_clearance(pts):
+            self.publish(0.0, 0.0)
+            self.state = "idle"
+            return
         last = msg.poses[-1].pose.orientation
         self.path = pts
         self.goal_yaw = quat_to_yaw(last.z, last.w)
@@ -148,6 +170,60 @@ class CustomPurePursuit(Node):
         self.last_progress_time = self.get_clock().now().nanoseconds / 1e9
         self.last_progress_dist = float("inf")
         self.get_logger().info(f"new /plan: {len(pts)} pts, goal_yaw={self.goal_yaw:.2f}")
+
+    def on_map(self, msg: OccupancyGrid) -> None:
+        data = np.array(msg.data, dtype=np.int16).reshape(
+            (msg.info.height, msg.info.width)
+        )
+        ys, xs = np.where(data >= 65)
+        self.occupied_cells = np.column_stack((xs, ys)).astype(np.float32)
+        self.map_resolution = float(msg.info.resolution)
+        self.map_origin = (
+            float(msg.info.origin.position.x),
+            float(msg.info.origin.position.y),
+        )
+        self.map_size = (int(msg.info.width), int(msg.info.height))
+
+    def path_has_clearance(self, pts: np.ndarray) -> bool:
+        if self.occupied_cells is None or self.map_resolution is None:
+            self.get_logger().error("rejecting /plan: raw /map not received yet")
+            return False
+        if self.occupied_cells.size == 0:
+            return True
+
+        ox, oy = self.map_origin
+        width, height = self.map_size
+        min_clearance = float("inf")
+        min_pt = pts[0]
+
+        for pt in pts:
+            mx = int(math.floor((float(pt[0]) - ox) / self.map_resolution))
+            my = int(math.floor((float(pt[1]) - oy) / self.map_resolution))
+            if not (0 <= mx < width and 0 <= my < height):
+                self.get_logger().error(
+                    f"rejecting /plan: point outside raw map ({pt[0]:.2f}, {pt[1]:.2f})"
+                )
+                return False
+
+            d_cells = self.occupied_cells - np.array([mx, my], dtype=np.float32)
+            clearance = float(np.min(np.hypot(d_cells[:, 0], d_cells[:, 1])))
+            clearance *= self.map_resolution
+            if clearance < min_clearance:
+                min_clearance = clearance
+                min_pt = pt
+
+        if min_clearance < self.path_min_clearance:
+            self.get_logger().error(
+                "rejecting /plan: raw-map clearance "
+                f"{min_clearance:.2f} m < {self.path_min_clearance:.2f} m "
+                f"near ({min_pt[0]:.2f}, {min_pt[1]:.2f})"
+            )
+            return False
+
+        self.get_logger().info(
+            f"/plan raw-map min clearance {min_clearance:.2f} m"
+        )
+        return True
 
     def on_scan(self, msg: LaserScan) -> None:
         if not self.safety_enable:

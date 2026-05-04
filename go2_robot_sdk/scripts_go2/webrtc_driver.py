@@ -32,6 +32,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import struct
 import time
 from Crypto.PublicKey import RSA
@@ -58,6 +59,7 @@ except Exception as e:
 logging.basicConfig(level=logging.WARN)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+logging.getLogger().setLevel(logging.WARNING)
 
 
 def calc_local_path_ending(data1):
@@ -301,8 +303,9 @@ class Go2Connection():
             # Start heartbeat to keep connection alive
             self.start_heartbeat()
 
-            # Enable video channel
-            self._send_raw("vid", "", "on")
+            if self.on_video_frame and os.environ.get("GO2_ENABLE_VIDEO", "1") == "1":
+                # Enable video channel only when a consumer is configured.
+                self._send_raw("vid", "", "on")
 
             if self.on_validated:
                 self.on_validated(self.robot_num)

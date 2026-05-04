@@ -57,6 +57,7 @@ from sensor_msgs.msg import Image, CameraInfo
 logging.basicConfig(level=logging.WARN)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+logging.getLogger().setLevel(logging.WARNING)
 
 
 class RobotBaseNode(Node):
@@ -87,6 +88,9 @@ class RobotBaseNode(Node):
         self.get_logger().info(f"Connection mode is {self.conn_mode}")
 
         self.conn = {}
+        self._dc_send_lock = threading.Lock()
+        self._dc_outbox = []
+        self._dc_delayed_outbox = []
         qos_profile = QoSProfile(depth=10)
 
         self.joint_pub = []
@@ -311,18 +315,14 @@ class RobotBaseNode(Node):
         #   ly = forward/back (twist.linear.x)
         #   lx = strafe left/right (-twist.linear.y for Unitree convention)
         #   rx = turn (-twist.angular.z for Unitree convention)
-        if x != 0.0 or y != 0.0 or z != 0.0:
-            self.robot_cmd_vel[robot_num] = json.dumps({
-                "type": "msg",
-                "topic": "rt/wirelesscontroller",
-                "data": {"lx": round(-y, 2), "ly": round(x, 2), "rx": round(-z, 2), "ry": 0}
-            })
-        else:
-            self.robot_cmd_vel[robot_num] = json.dumps({
-                "type": "msg",
-                "topic": "rt/wirelesscontroller",
-                "data": {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
-            })
+        payload = json.dumps({
+            "type": "msg",
+            "topic": "rt/wirelesscontroller",
+            "data": {"lx": round(-y, 2), "ly": round(x, 2), "rx": round(-z, 2), "ry": 0}
+            if (x != 0.0 or y != 0.0 or z != 0.0)
+            else {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
+        })
+        self.robot_cmd_vel[robot_num] = payload
 
 
     def joy_cb(self, msg):
@@ -364,32 +364,94 @@ class RobotBaseNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         self.go2_lidar_pub[0].publish(msg)
 
-    def _send_dc(self, robot_num, payload):
-        """Send payload over data channel."""
+    def _send_dc_now(self, robot_num, payload):
+        """Send payload over data channel from the asyncio/WebRTC thread."""
+        if robot_num not in self.conn:
+            return False
         conn = self.conn[robot_num]
         if not conn.data_channel_opened:
-            return
+            return False
         conn.data_channel.send(payload)
+        return True
+
+    def _send_dc(self, robot_num, payload):
+        """Queue a payload for the asyncio/WebRTC loop to drain."""
+        with self._dc_send_lock:
+            self._dc_outbox.append((robot_num, payload, None))
+
+    def _flush_cmd_vel(self, robot_num):
+        try:
+            payload = self.robot_cmd_vel.get(robot_num)
+            if payload is None:
+                return
+            if not self._send_dc_now(robot_num, payload):
+                return
+            self.robot_cmd_vel[robot_num] = None
+        except Exception as exc:
+            self.get_logger().warning(f"cmd_vel send error: {exc}")
+
+    def _schedule_dc_send(self, delay_s, robot_num, payload, label):
+        due_at = time.monotonic() + delay_s
+        with self._dc_send_lock:
+            self._dc_delayed_outbox.append((due_at, robot_num, payload, label))
+
+    def _drain_dc_outbox(self, robot_num):
+        now = time.monotonic()
+        ready = []
+        with self._dc_send_lock:
+            remaining_delayed = []
+            for entry in self._dc_delayed_outbox:
+                due_at, target_robot, payload, label = entry
+                if target_robot == robot_num and due_at <= now:
+                    ready.append((target_robot, payload, label))
+                else:
+                    remaining_delayed.append(entry)
+            self._dc_delayed_outbox = remaining_delayed
+
+            remaining_immediate = []
+            for entry in self._dc_outbox:
+                target_robot, payload, label = entry
+                if target_robot == robot_num:
+                    ready.append(entry)
+                else:
+                    remaining_immediate.append(entry)
+            self._dc_outbox = remaining_immediate
+
+        for target_robot, payload, label in ready:
+            try:
+                if self._send_dc_now(target_robot, payload):
+                    if label:
+                        self.get_logger().info(
+                            f"{label}: sent to robot {target_robot}")
+                else:
+                    with self._dc_send_lock:
+                        self._dc_delayed_outbox.append(
+                            (time.monotonic() + 0.5, target_robot, payload, label))
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"{label or 'data channel'} send to robot {target_robot} failed: {exc}")
+
+    def _video_enabled(self) -> bool:
+        return os.environ.get("GO2_ENABLE_VIDEO", "1") == "1"
 
     def joy_cmd(self, robot_num):
 
         if self.conn_type == 'webrtc':
+            self._drain_dc_outbox(robot_num)
             if robot_num in self.conn and robot_num in self.robot_cmd_vel and self.robot_cmd_vel[robot_num] is not None:
-                self.get_logger().info("Move")
-                self._send_dc(robot_num, self.robot_cmd_vel[robot_num])
-                self.robot_cmd_vel[robot_num] = None
+                self._flush_cmd_vel(robot_num)
 
             if robot_num in self.conn and self.joy_state.buttons and self.joy_state.buttons[1]:
                 self.get_logger().info("Stand down")
                 stand_down_cmd = gen_command(ROBOT_CMD["StandDown"])
-                self._send_dc(robot_num, stand_down_cmd)
+                self._send_dc_now(robot_num, stand_down_cmd)
 
             if robot_num in self.conn and self.joy_state.buttons and self.joy_state.buttons[0]:
                 self.get_logger().info("Stand up")
                 stand_up_cmd = gen_command(ROBOT_CMD["StandUp"])
-                self._send_dc(robot_num, stand_up_cmd)
+                self._send_dc_now(robot_num, stand_up_cmd)
                 move_cmd = gen_command(ROBOT_CMD['BalanceStand'])
-                self.conn[robot_num].data_channel.send(move_cmd)
+                self._send_dc_now(robot_num, move_cmd)
 
     def on_validated(self, robot_num):
         if robot_num in self.conn:
@@ -397,8 +459,9 @@ class RobotBaseNode(Node):
             self.get_logger().info(
                 f"Subscribing to {len(RTC_TOPIC)} topics on DC "
                 f"(state={dc.readyState})")
-            # Enable video stream from robot
-            dc.send(json.dumps({"type": "vid", "topic": "", "data": "on"}))
+            if self._video_enabled():
+                # Enable video stream from robot only when explicitly needed.
+                dc.send(json.dumps({"type": "vid", "topic": "", "data": "on"}))
             for topic in RTC_TOPIC.values():
                 dc.send(json.dumps({"type": "subscribe", "topic": topic}))
 
@@ -458,46 +521,38 @@ class RobotBaseNode(Node):
                 # Note: _wake_up_sequence uses threading which breaks when the
                 # dc.send requires an asyncio event loop. Schedule on loop here.
                 if os.environ.get("GO2_AUTO_WAKE", "1") == "1":
-                    import asyncio as _asyncio
-                    async def _auto_wake():
-                        for cmd_name, delay in (("RecoveryStand", 2.5),
-                                                ("BalanceStand", 0.0)):
-                            try:
-                                self.get_logger().info(
-                                    f"GO2_AUTO_WAKE: sending {cmd_name}")
-                                dc.send(gen_command(ROBOT_CMD[cmd_name]))
-                                if delay:
-                                    await _asyncio.sleep(delay)
-                            except Exception as exc:
-                                self.get_logger().warning(
-                                    f"GO2_AUTO_WAKE {cmd_name}: {exc}")
-                        # ULTRATHINK fix #A: Disable Go2 onboard obstacle
-                        # avoidance. Default-ON behavior overrides external
-                        # cmd_vel near walls (~20-30cm) → Nav2 controller's
-                        # commands silently ignored, robot rocks back/forth
-                        # at narrow doorways. This is exactly what blocked
-                        # us in retries #1-15 even after disabling Nav2's
-                        # own collision detection. Set via api_id=1001
-                        # (Switch) on rt/api/obstacles_avoid/request topic.
-                        # Disable with GO2_DISABLE_OBSTACLE_AVOID=0.
-                        if os.environ.get("GO2_DISABLE_OBSTACLE_AVOID", "1") == "1":
-                            try:
-                                oa_id = int(_t.time() * 1000) % 2147483647
-                                dc.send(json.dumps({
-                                    "type": "req",
-                                    "topic": "rt/api/obstacles_avoid/request",
-                                    "data": {
-                                        "header": {"identity": {"id": oa_id, "api_id": 1001}},
-                                        "parameter": json.dumps({"enable": False}),
-                                    },
-                                }))
-                                self.get_logger().info(
-                                    "GO2_DISABLE_OBSTACLE_AVOID: sent disable "
-                                    "(api_id=1001 obstacles_avoid switch off)")
-                            except Exception as exc:
-                                self.get_logger().warning(
-                                    f"GO2_DISABLE_OBSTACLE_AVOID failed: {exc}")
-                    _asyncio.get_event_loop().create_task(_auto_wake())
+                    self._schedule_dc_send(
+                        0.0,
+                        robot_num,
+                        gen_command(ROBOT_CMD["RecoveryStand"]),
+                        "GO2_AUTO_WAKE RecoveryStand",
+                    )
+                    self._schedule_dc_send(
+                        2.5,
+                        robot_num,
+                        gen_command(ROBOT_CMD["BalanceStand"]),
+                        "GO2_AUTO_WAKE BalanceStand",
+                    )
+                    # Disable onboard obstacle avoidance when externally
+                    # driving /cmd_vel. The Go2 firmware can otherwise ignore
+                    # near-wall commands. Switch API: api_id=1001 on
+                    # rt/api/obstacles_avoid/request. Disable this behavior
+                    # with GO2_DISABLE_OBSTACLE_AVOID=0.
+                    if os.environ.get("GO2_DISABLE_OBSTACLE_AVOID", "1") == "1":
+                        oa_id = int(_t.time() * 1000) % 2147483647
+                        self._schedule_dc_send(
+                            3.0,
+                            robot_num,
+                            json.dumps({
+                                "type": "req",
+                                "topic": "rt/api/obstacles_avoid/request",
+                                "data": {
+                                    "header": {"identity": {"id": oa_id, "api_id": 1001}},
+                                    "parameter": json.dumps({"enable": False}),
+                                },
+                            }),
+                            "GO2_DISABLE_OBSTACLE_AVOID",
+                        )
             else:
                 _motion_switcher("normal")
                 _t.sleep(0.5)  # let Go2 transition before hitting USLAM
@@ -1628,7 +1683,7 @@ class RobotBaseNode(Node):
             token=token,
             on_validated=self.on_validated,
             on_message=self.on_data_channel_message,
-            on_video_frame=self.on_video_frame,
+            on_video_frame=self.on_video_frame if self._video_enabled() else None,
         )
 
         self.conn[robot_num] = conn
