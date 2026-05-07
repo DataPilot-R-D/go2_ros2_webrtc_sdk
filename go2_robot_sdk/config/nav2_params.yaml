@@ -25,8 +25,13 @@ amcl:
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    # Sprint 2 fix: enable AMCL kidnap recovery. With both alphas at 0.0
+    # AMCL never injects random particles when likelihood drops, so once
+    # the filter locks onto a confidently-wrong pose (observed empirically
+    # 2026-05-06 door-probe: median_abs_error 0.28-0.58m while
+    # converged=true) it cannot recover. Standard tuning per Nav2 docs.
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     robot_model_type: "nav2_amcl::OmniMotionModel"
     save_pose_rate: 0.5
@@ -269,18 +274,19 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # inflation_radius is a cost GRADIENT, not a safety barrier —
-        # collision is already prevented by robot_radius in the footprint
-        # check. A large radius + gentle falloff makes the planner PREFER
-        # center-of-room paths but still lets it route through doorways.
-        # 0.20 → 0.05 — robot reached doorway (test #18) but stopped because
-        # local_costmap's 0.20m inflation around scan walls left only ~0.20m
-        # clear corridor (vs 0.34m robot width). Hard collision protection
-        # comes from rectangular footprint check; gradient just guides path
-        # preference. Real doorways 60-65cm: with footprint 34cm + 2×5cm
-        # inflation = 44cm needed — fits.
+        # Sprint 2 fix: 0.05 → 0.20. Inflation layer provides the soft cost
+        # gradient that lets the controller naturally prefer center-of-corridor
+        # without any custom logic. With 0.05 there was effectively no
+        # gradient — controller had to make hard accept/reject decisions at
+        # the wall edge, which the previous custom pure-pursuit hard-stopped
+        # via "scan blocked" predicate. With MPPI controller (Sprint 2 Phase C)
+        # the gradient drives soft trajectory deflection: ObstaclesCritic
+        # samples thousands of trajectories and prefers low-cost ones, so a
+        # ~0.20m inflation gives 7-tier exponential cost falloff.
+        # 80cm door - 34cm footprint = 23cm clearance/side; 0.20m inflation
+        # creates a gradient through that whole corridor space, peak at wall.
         cost_scaling_factor: 3.0
-        inflation_radius: 0.05
+        inflation_radius: 0.20
 
 global_costmap:
   global_costmap:
@@ -293,7 +299,13 @@ global_costmap:
       robot_base_frame: base_link
       use_sim_time: False
       resolution: 0.05
-      track_unknown_space: False
+      # Sprint 2 fix: False → True. Inconsistency with planner's
+      # allow_unknown=true on line ~384 — costmap was treating NO_INFORMATION
+      # as FREE (passable) while planner was told it could plan through
+      # unknown. Now both layers agree: costmap distinguishes UNKNOWN
+      # cells, planner is permitted to traverse them. Crucial near doorways
+      # where /scan can produce small UNKNOWN patches at frame edges.
+      track_unknown_space: True
       static_map: True
       width: 500
       height: 500
@@ -400,11 +412,15 @@ planner_server:
 lifecycle_manager_navigation:
   ros__parameters:
     autostart: true
-    # Disabled controller_server, smoother_server, velocity_smoother because
-    # custom_controller.py replaces them (DimOS-style pure-pursuit, works on
-    # this Go2 in this house per user's prior projects). Planner stays —
-    # it correctly computes /plan paths through doorways.
-    node_names: ["planner_server", "behavior_server", "bt_navigator", "waypoint_follower"]
+    # Sprint 2 fix: re-enable controller_server, smoother_server,
+    # velocity_smoother. Previously disabled because custom_controller.py
+    # (DimOS pure-pursuit) replaced them — Sprint 2 swaps to Nav2 standard
+    # MPPI Controller (configured in controller_server FollowPath section)
+    # which works through narrow doorways out of the box per Macenski 2024.
+    # With controller_server back in lifecycle, the standard Nav2 BT
+    # recovery subtree (Spin / BackUp / ClearCostmap / Wait) finally works
+    # because behavior_server has a controller to bond with.
+    node_names: ["controller_server", "smoother_server", "planner_server", "behavior_server", "bt_navigator", "waypoint_follower", "velocity_smoother"]
     bond_timeout: 0.0
 
 behavior_server:
