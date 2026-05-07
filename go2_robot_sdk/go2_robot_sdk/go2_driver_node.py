@@ -772,22 +772,47 @@ class RobotBaseNode(Node):
                 conn_ref = self.conn[robot_num]
                 async def _probe_readonly():
                     await asyncio.sleep(5.0)
-                    os.makedirs("/tmp/go2-probe", exist_ok=True)
+                    out_dir = os.environ.get("GO2_PROBE_DIR", "/tmp/go2-probe")
+                    os.makedirs(out_dir, exist_ok=True)
                     # Optional: trigger a fresh publish of the served file
                     # (harmless — does not modify state).
                     dc.send(json.dumps({"type": "msg", "topic": RTC_TOPIC["USLAM_CMD"],
                                         "data": "common/get_map_file"}))
                     await asyncio.sleep(1.5)
-                    for fp in ("map.pcd", "map.pgm", "map.txt"):
+                    raw_files = os.environ.get("GO2_PROBE_MAP_FILES", "")
+                    if raw_files:
+                        files = tuple(
+                            f.strip()
+                            for f in raw_files.replace("\n", ",").split(",")
+                            if f.strip()
+                        )
+                    else:
+                        files = ("map.pcd", "map.pgm", "map.txt")
+                    summary = []
+                    summary_path = os.path.join(out_dir, "static-file-probe-summary.json")
+                    for fp in files:
+                        rec = {"file_path": fp, "ok": False, "saved_to": None, "error": None}
                         try:
-                            b = await conn_ref.download_static_file(fp, timeout=60.0)
-                            out = f"/tmp/go2-probe/dom_{fp}"
+                            b = await conn_ref.download_static_file(fp, timeout=float(os.environ.get("GO2_PROBE_FILE_TIMEOUT", "60.0")))
+                            safe_fp = fp.strip("/").replace("/", "__") or "root"
+                            out = os.path.join(out_dir, f"dom_{safe_fp}")
                             with open(out, "wb") as f:
                                 f.write(b)
+                            rec.update({
+                                "ok": True,
+                                "saved_to": out,
+                                "size": len(b),
+                            })
                             self.get_logger().info(
                                 f"PROBE RO: {out} ({len(b)} bytes)")
                         except Exception as exc:
+                            rec["error"] = repr(exc)
                             self.get_logger().error(f"PROBE RO: {fp} failed: {exc}")
+                        finally:
+                            summary.append(rec)
+                            with open(summary_path, "w") as f:
+                                json.dump(summary, f, indent=2, sort_keys=True)
+                    self.get_logger().info(f"PROBE RO: summary {summary_path}")
                 asyncio.get_event_loop().create_task(_probe_readonly())
 
             # PROBE: one-shot map download. mapping/stop → common/get_map_file
