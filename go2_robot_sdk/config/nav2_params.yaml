@@ -118,97 +118,140 @@ bt_navigator_navigate_to_pose_rclcpp_node:
 controller_server:
   ros__parameters:
     use_sim_time: False
-    # 3.0 → 10.0 — at 3Hz cycle is 333ms; with WebRTC TF latency (200-700ms)
-    # controller often reads stale TF. At 10Hz controller skips stale frames
-    # rather than stalling on Extrapolation Error.
-    controller_frequency: 10.0
+    # Sprint 2 Phase C: bump 10.0 → 30.0 for MPPI. MPPI is sampling-based
+    # (2000 trajectories/cycle) and benefits from higher frequency for
+    # reactive obstacle avoidance. Macenski 2024 talks: 50Hz typical on
+    # modern CPU; 30Hz safe for ros2_m1_native (Apple Silicon) + Go2 host.
+    controller_frequency: 30.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: "progress_checker"
-    goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
+    goal_checker_plugins: ["general_goal_checker"]
     controller_plugins: ["FollowPath"]
 
-    # Progress checker parameters
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.1
       movement_time_allowance: 10.0
-    # Goal checker parameters
-    #precise_goal_checker:
-    #  plugin: "nav2_controller::SimpleGoalChecker"
-    #  xy_goal_tolerance: 0.25
-    #  yaw_goal_tolerance: 0.25
-    #  stateful: True
+
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.25
       yaw_goal_tolerance: 0.25
-    # RotationShimController wraps DWB — first rotates the robot in
-    # place toward the path heading before handing off to the driving
-    # controller. Quadrupeds like Go2 yaw freely but DWB alone tries to
-    # drive + rotate simultaneously, which fails near doorways
-    # (trajectory samples all collide with frame). The shim eliminates
-    # that "stuck rotating and driving" failure mode. See
-    # https://docs.nav2.org/configuration/packages/configuring-rotation-shim-controller.html
-    # ULTRATHINK Plan B: DWB rejected ALL 251 trajectories on 12 successive
-    # restarts despite tuning sim_time, vel limits, robot_radius, inflation,
-    # voxel_layer enable/disable, and dual-map architecture. The 819→251
-    # reduction confirmed our sample-count fixes were applied — but rejection
-    # rate stayed 100%. Conclusion: sample-and-score model is structurally
-    # incompatible with our environment (tight rooms + WebRTC TF jitter +
-    # cleaned/raw map disagreement). Switching to RegulatedPurePursuit which
-    # follows the global path strictly without trajectory sampling.
+
+    # Sprint 2 Phase C controller swap: RotationShim+RegulatedPurePursuit
+    # → MPPI Controller (Model Predictive Path Integral).
+    #
+    # WHY MPPI:
+    # - Industry standard 2026 for narrow-passage indoor navigation.
+    #   Steve Macenski (Nav2 maintainer): MPPI is "successor to TEB and
+    #   pure path tracking MPC controllers", released mainline Humble,
+    #   45% faster in Jazzy via Eigen reimpl.
+    # - Sampling-based (2000 trajectories/cycle) — soft trajectory
+    #   correction via cost critics, no hard veto. Replaces our custom
+    #   "scan blocked" hard-stop predicate with native MPPI ObstaclesCritic
+    #   which gradually pushes trajectories away from walls.
+    # - Plugin-architecture for critics — tuneable per-environment without
+    #   code changes. Path/Obstacle/Goal critics auto-balance:
+    #   PathAlignCritic disables itself when local path blocked, so
+    #   ObstaclesCritic takes over for soft deflection.
+    #
+    # Previous attempts:
+    # - DWB: rejected 251/251 trajectories in 12 successive runs (sampling
+    #   model rejected by tight environment + WebRTC TF jitter)
+    # - RPP: passed doorways once but couldn't react to obstacles (path-
+    #   tracker, no avoidance) — required custom_controller.py veto layer
+    # - custom_controller.py (DimOS pure-pursuit): worked once at 13:31
+    #   on 2026-05-06, not repeatable; 506 lines of unmaintainable Python
+    #
+    # MPPI parameters tuned for Go2 narrow-passage from Nav2 docs +
+    # community examples. KEY tuning rule per Macenski Tuning Guide:
+    # ObstaclesCritic.cost_weight should NOT be too high or robot jitters
+    # in narrow corridors — keep at 4.0 for "soft" deflection, use
+    # critical_weight: 20.0 for near-collision spike behavior.
     FollowPath:
-      plugin: "nav2_rotation_shim_controller::RotationShimController"
-      primary_controller: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      # RotationShim wrapper — rotates to path heading first, then hands off
-      # to RPP for path following.
-      angular_dist_threshold: 0.785
-      forward_sampling_distance: 0.5
-      rotate_to_heading_angular_vel: 0.8
-      max_angular_accel: 3.2
-      simulate_ahead_time: 1.0
-      # RPP params — agent-recommended for Go2 indoor:
-      # Tuned to match DimOS/replanning_a_star/local_planner.py PController
-      # which user verified DOES patrol Go2 between rooms (no Nav2 path).
-      # Key: Go2 ignores cmd_vel < 0.2 m/s — must always send ≥ 0.2.
-      # User test #16 worked (passed doorway!) but two issues:
-      # (1) zigzag — rotate-then-drive switching too eager.
-      # (2) clipped obstacles — onboard avoidance disabled, no fallback.
-      # Fix #1: bigger lookahead + raise rotate-to-heading threshold so
-      # RPP smooth-drives with angular correction instead of rotate-pause-drive.
-      # Fix #2: lower max velocity so user can react / no Nav2 collision check
-      # but Go2 firmware still has emergency-stop on contact (slower = safer).
-      desired_linear_vel: 0.3                 # was 0.55, slower for safety
-      lookahead_dist: 1.0                     # was 0.6 — bigger = smoother arc
-      min_lookahead_dist: 0.5
-      max_lookahead_dist: 1.4
-      lookahead_time: 1.5
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      model_dt: 0.033              # 1 / controller_frequency = 1/30
+      batch_size: 2000
+      vx_std: 0.2
+      vy_std: 0.0                  # diff-drive — Go2 nieholonomiczny
+      wz_std: 0.4
+      vx_max: 0.4                  # Go2 floor 0.2; cap 0.4 for safety
+      vx_min: 0.0                  # no reversing
+      wz_max: 1.5
+      ax_max: 3.0
+      ay_max: 3.0
+      az_max: 3.5
+      iteration_count: 1
+      prune_distance: 1.7
       transform_tolerance: 1.5
-      use_velocity_scaled_lookahead_dist: true
-      min_approach_linear_velocity: 0.20      # Go2 floor — anything below stalls
-      approach_velocity_scaling_dist: 0.6
-      # Stays disabled. Test #18: even with rectangular footprint + inflation
-      # 0.05, RPP vetos every doorway (~60cm) because /scan walls are within
-      # 5cm of footprint edge. Test #16-17: with this off, robot physically
-      # navigates and passes doorway. Real obstacle safety should be a
-      # SEPARATE collision_monitor node (not coupled to path-following).
-      use_collision_detection: false
-      max_allowed_time_to_collision_up_to_carrot: 1.0
-      use_regulated_linear_velocity_scaling: true
-      use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 0.9
-      regulated_linear_scaling_min_speed: 0.25
-      # Smooth drive instead of rotate-pause-drive. With this OFF, RPP applies
-      # angular correction continuously while driving forward → no zigzag.
-      use_rotate_to_heading: false
-      allow_reversing: false
-      rotate_to_heading_min_angle: 1.5        # 85° — only rotate-in-place if
-                                              # heading is near-backward
-      max_robot_pose_search_dist: 10.0
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      visualize: false
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.0
+      critics: ["ConstraintCritic", "ObstaclesCritic", "GoalCritic",
+                "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+                "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0           # KEEP LOW — high values cause jitter in narrow corridor (Macenski Tuning Guide)
+        critical_weight: 20.0      # Near-collision spike — sharp cost rise <10cm from wall
+        consider_footprint: true
+        collision_cost: 10000.0
+        collision_margin_distance: 0.10
+        near_goal_distance: 0.5
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 12.0          # Lower than default (32.0) — lets MPPI deflect from /plan when obstacles block it
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
 
 local_costmap:
   local_costmap:
@@ -466,3 +509,71 @@ waypoint_follower:
       plugin: "nav2_waypoint_follower::WaitAtWaypoint"
       enabled: True
       waypoint_pause_duration: 200
+
+# Sprint 2 Phase C: standard Nav2 path smoother (smooths /plan output
+# from SmacPlanner2D before it reaches MPPI controller). Replaces the
+# off-by-default smoother in planner_server's GridBased section.
+# Standard Nav2 defaults — no Go2-specific tuning needed.
+smoother_server:
+  ros__parameters:
+    use_sim_time: False
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+# Sprint 2 Phase C: standard Nav2 cmd_vel rate-limiter. Sits in parallel
+# with /cmd_vel (subscribes /cmd_vel from MPPI, publishes /cmd_vel_smoothed).
+# Driver currently listens directly to /cmd_vel — Sprint 3 will wire the
+# full chain (controller→smoother→collision_monitor→/cmd_vel) via launch
+# file remaps. For Phase C, velocity_smoother runs as monitoring-only
+# (publishes /cmd_vel_smoothed, driver ignores) so lifecycle can activate it.
+# Tuning: max_velocity / max_accel matched to Go2 firmware capability.
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: False
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.5, 0.0, 2.5]
+    min_velocity: [-0.5, 0.0, -2.5]
+    max_accel: [2.5, 0.0, 3.2]
+    max_decel: [-2.5, 0.0, -3.2]
+    odom_topic: "odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+# Sprint 3 stub: nav2_collision_monitor for soft slowdown/stop zones.
+# Not yet wired into cmd_vel chain — requires supervisor changes to spawn
+# the node + launch file remaps for proper topic flow:
+#   controller_server → /cmd_vel_nav (remap)
+#   collision_monitor in=/cmd_vel_nav, out=/cmd_vel
+#   driver subscribes /cmd_vel
+# Reference config (commented out, uncomment + wire in Sprint 3):
+# collision_monitor:
+#   ros__parameters:
+#     base_frame_id: "base_link"
+#     odom_frame_id: "odom"
+#     cmd_vel_in_topic: "cmd_vel_nav"
+#     cmd_vel_out_topic: "cmd_vel"
+#     transform_tolerance: 0.5
+#     source_timeout: 1.0
+#     polygons: ["SlowZone", "StopZone"]
+#     SlowZone:
+#       type: "polygon"
+#       points: "[[0.45, 0.30], [0.45, -0.30], [-0.20, -0.30], [-0.20, 0.30]]"
+#       action_type: "slowdown"
+#       slowdown_ratio: 0.4
+#       min_points: 4
+#     StopZone:
+#       type: "polygon"
+#       points: "[[0.18, 0.18], [0.18, -0.18], [-0.10, -0.18], [-0.10, 0.18]]"
+#       action_type: "stop"
+#       min_points: 4
+#     observation_sources: ["scan"]
+#     scan:
+#       type: "scan"
+#       topic: "/scan"
