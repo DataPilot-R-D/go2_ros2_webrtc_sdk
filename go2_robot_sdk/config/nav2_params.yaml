@@ -45,6 +45,12 @@ amcl:
     z_rand: 0.1
     z_short: 0.05
     scan_topic: scan
+    # Sprint 2 Phase 0 (post-review): explicit operator-driven initial pose.
+    # Operator sets via `ros2 topic pub --once /initialpose ...` from the
+    # known door-probe start (1.975, -3.173). Setting set_initial_pose:false
+    # avoids AMCL grabbing whatever is in initial_pose_{x,y,yaw} params at
+    # boot — keeps run-to-run AMCL state reproducible across Phase D runs.
+    set_initial_pose: false
 
 bt_navigator:
   ros__parameters:
@@ -182,17 +188,32 @@ controller_server:
       wz_std: 0.4
       vx_max: 0.4                  # Go2 floor 0.2; cap 0.4 for safety
       vx_min: 0.0                  # no reversing
+      vy_max: 0.0                  # diff-drive — explicit for parsers
       wz_max: 1.5
       ax_max: 3.0
       ay_max: 3.0
       az_max: 3.5
       iteration_count: 1
       prune_distance: 1.7
-      transform_tolerance: 1.5
+      # Sprint 2 Phase 0 (post-review): 1.5 → 0.3
+      # 1.5s was 15× Nav2 default (0.1s) and far above Macenski's "<0.5s
+      # max safe for noisy TF" guidance — meant MPPI could be planning
+      # trajectories on odom from 1.5s ago = guaranteed collision in narrow
+      # corridor. WebRTC TF jitter is 200-700ms so 0.3s gives a safety margin
+      # above worst-case while keeping controller reactive.
+      transform_tolerance: 0.3
       temperature: 0.3
       gamma: 0.015
       motion_model: "DiffDrive"
       visualize: false
+      # Sprint 2 Phase 0 (post-review): enable diagnostic publishers for
+      # Phase D telemetry. publish_optimal_trajectory exposes winning sample
+      # on /controller_server/optimal_trajectory; publish_critic_scores
+      # exposes nav2_msgs/CriticsStats on /controller_server/critic_scores
+      # — proper MPPI rejection rate diagnostic (NOT optimal_trajectory
+      # which is just the chosen one). Both are off by default.
+      publish_optimal_trajectory: true
+      publish_critic_scores: true
       TrajectoryVisualizer:
         trajectory_step: 5
         time_step: 3
@@ -232,7 +253,7 @@ controller_server:
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 12.0          # Lower than default (32.0) — lets MPPI deflect from /plan when obstacles block it
+        cost_weight: 12.0          # Lower than current main default (14.0) — lets MPPI deflect from /plan when obstacles block it (note: old docs said 32.0 — Macenski lowered to 14 in Aug 2024)
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
         threshold_to_consider: 0.5
