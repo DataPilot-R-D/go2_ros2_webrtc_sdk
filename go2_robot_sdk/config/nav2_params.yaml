@@ -30,6 +30,12 @@ amcl:
     # the filter locks onto a confidently-wrong pose (observed empirically
     # 2026-05-06 door-probe: median_abs_error 0.28-0.58m while
     # converged=true) it cannot recover. Standard tuning per Nav2 docs.
+    #
+    # TUNING NOTE (review #8): 0.1 is at AGGRESSIVE end of Nav2 examples
+    # (0.05-0.1 typical). With WebRTC TF jitter, a single bad scan can
+    # inject 10% random particles → may cause spurious kidnap-recovery
+    # events. If Phase D shows AMCL twitchiness, try 0.05/0.001 as
+    # conservative alternative.
     recovery_alpha_fast: 0.1
     recovery_alpha_slow: 0.001
     resample_interval: 1
@@ -199,8 +205,15 @@ controller_server:
       # 1.5s was 15× Nav2 default (0.1s) and far above Macenski's "<0.5s
       # max safe for noisy TF" guidance — meant MPPI could be planning
       # trajectories on odom from 1.5s ago = guaranteed collision in narrow
-      # corridor. WebRTC TF jitter is 200-700ms so 0.3s gives a safety margin
-      # above worst-case while keeping controller reactive.
+      # corridor.
+      #
+      # TRADEOFF (review #6): WebRTC TF jitter observed empirically at
+      # 200-700ms. With transform_tolerance: 0.3, ~700ms-stale TF will
+      # cause MPPI to refuse the cycle ("could not transform map→base_link")
+      # → controller starvation visible in /diagnostics. This is INTENTIONAL
+      # diagnostic behavior — better to skip a cycle than collide.
+      # If Phase D shows excessive starvation: try 0.5 (Macenski max safe)
+      # or fix WebRTC TF latency at source (driver-level).
       transform_tolerance: 0.3
       temperature: 0.3
       gamma: 0.015
@@ -212,6 +225,15 @@ controller_server:
       # exposes nav2_msgs/CriticsStats on /controller_server/critic_scores
       # — proper MPPI rejection rate diagnostic (NOT optimal_trajectory
       # which is just the chosen one). Both are off by default.
+      #
+      # HUMBLE COMPATIBILITY WARNING (review #5): these params landed in
+      # nav2_mppi_controller in Iron (Aug 2023). For Humble, backport
+      # status is uncertain. Nav2 silently ignores unknown YAML keys,
+      # so worst case is "topics don't exist" not crash. Verify after
+      # first robot boot:
+      #   ros2 topic list | grep controller_server
+      # If topics absent, fall back to logging from controller_server
+      # debug output for MPPI diagnostics.
       publish_optimal_trajectory: true
       publish_critic_scores: true
       TrajectoryVisualizer:
