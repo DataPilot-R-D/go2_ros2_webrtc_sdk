@@ -28,7 +28,10 @@ slam_toolbox:
     transform_publish_period: 0.02 # if 0 never publishes odometry
     map_update_interval: 5.0
     resolution: 0.05
-    max_laser_range: 20.0 # for rastering images
+    # Match Go2 utlidar actual capability — SLAM Toolbox warned and
+    # SIGSEGV'd on M1 when it tried to process 0 m / >10 m rays.
+    min_laser_range: 0.2
+    max_laser_range: 10.0
     minimum_time_interval: 0.5
     transform_timeout: 0.2
     tf_buffer_duration: 30.0
@@ -45,10 +48,17 @@ slam_toolbox:
     link_match_minimum_response_fine: 0.1  
     link_scan_maximum_distance: 1.5
     loop_search_maximum_distance: 3.0
-    do_loop_closing: true 
-    loop_match_minimum_chain_size: 10           
-    loop_match_maximum_variance_coarse: 3.0  
-    loop_match_minimum_response_coarse: 0.35    
+    # Loop closing triggers a Ceres graph optimization pass. On Apple
+    # Silicon this is the repeating SIGSEGV source: the thread that
+    # runs CeresSolver trips an alignment / memory corruption bug in
+    # the prebuilt ROS2 Humble + libceres combo. Disable loop closing
+    # to keep SLAM stable during teleop walks. Map quality drops
+    # (drift over long traversals), but for indoor dispatch over
+    # tens of metres it's well within tolerance.
+    do_loop_closing: false
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
     loop_match_minimum_response_fine: 0.45
 
     # Correlation Parameters - Correlation Parameters

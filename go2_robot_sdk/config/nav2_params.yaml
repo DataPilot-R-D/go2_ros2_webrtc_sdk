@@ -11,7 +11,9 @@ amcl:
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
     do_beamskip: false
-    global_frame_id: "odom"
+    # 'map' when AMCL is localizing on a static pre-built map (our Nav2
+    # integration path). AMCL publishes map→odom TF in that case.
+    global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
     laser_max_range: 100.0
@@ -23,8 +25,19 @@ amcl:
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    # Sprint 2 fix: enable AMCL kidnap recovery. With both alphas at 0.0
+    # AMCL never injects random particles when likelihood drops, so once
+    # the filter locks onto a confidently-wrong pose (observed empirically
+    # 2026-05-06 door-probe: median_abs_error 0.28-0.58m while
+    # converged=true) it cannot recover. Standard tuning per Nav2 docs.
+    #
+    # TUNING NOTE (review #8): 0.1 is at AGGRESSIVE end of Nav2 examples
+    # (0.05-0.1 typical). With WebRTC TF jitter, a single bad scan can
+    # inject 10% random particles → may cause spurious kidnap-recovery
+    # events. If Phase D shows AMCL twitchiness, try 0.05/0.001 as
+    # conservative alternative.
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
     resample_interval: 1
     robot_model_type: "nav2_amcl::OmniMotionModel"
     save_pose_rate: 0.5
@@ -38,11 +51,18 @@ amcl:
     z_rand: 0.1
     z_short: 0.05
     scan_topic: scan
+    # Sprint 2 Phase 0 (post-review): explicit operator-driven initial pose.
+    # Operator sets via `ros2 topic pub --once /initialpose ...` from the
+    # known door-probe start (1.975, -3.173). Setting set_initial_pose:false
+    # avoids AMCL grabbing whatever is in initial_pose_{x,y,yaw} params at
+    # boot — keeps run-to-run AMCL state reproducible across Phase D runs.
+    set_initial_pose: false
 
 bt_navigator:
   ros__parameters:
     use_sim_time: False
-    global_frame: odom
+    # Navigator plans + tracks in map frame (provided by AMCL via TF).
+    global_frame: map
     robot_base_frame: base_link
     odom_topic: odom
     bt_loop_duration: 10
@@ -110,79 +130,180 @@ bt_navigator_navigate_to_pose_rclcpp_node:
 controller_server:
   ros__parameters:
     use_sim_time: False
-    controller_frequency: 3.0
+    # Sprint 2 Phase C: bump 10.0 → 30.0 for MPPI. MPPI is sampling-based
+    # (2000 trajectories/cycle) and benefits from higher frequency for
+    # reactive obstacle avoidance. Macenski 2024 talks: 50Hz typical on
+    # modern CPU; 30Hz safe for ros2_m1_native (Apple Silicon) + Go2 host.
+    controller_frequency: 30.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: "progress_checker"
-    goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
+    goal_checker_plugins: ["general_goal_checker"]
     controller_plugins: ["FollowPath"]
 
-    # Progress checker parameters
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.1
       movement_time_allowance: 10.0
-    # Goal checker parameters
-    #precise_goal_checker:
-    #  plugin: "nav2_controller::SimpleGoalChecker"
-    #  xy_goal_tolerance: 0.25
-    #  yaw_goal_tolerance: 0.25
-    #  stateful: True
+
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.25
       yaw_goal_tolerance: 0.25
-    # DWB parameters
+
+    # Sprint 2 Phase C controller swap: RotationShim+RegulatedPurePursuit
+    # → MPPI Controller (Model Predictive Path Integral).
+    #
+    # WHY MPPI:
+    # - Industry standard 2026 for narrow-passage indoor navigation.
+    #   Steve Macenski (Nav2 maintainer): MPPI is "successor to TEB and
+    #   pure path tracking MPC controllers", released mainline Humble,
+    #   45% faster in Jazzy via Eigen reimpl.
+    # - Sampling-based (2000 trajectories/cycle) — soft trajectory
+    #   correction via cost critics, no hard veto. Replaces our custom
+    #   "scan blocked" hard-stop predicate with native MPPI ObstaclesCritic
+    #   which gradually pushes trajectories away from walls.
+    # - Plugin-architecture for critics — tuneable per-environment without
+    #   code changes. Path/Obstacle/Goal critics auto-balance:
+    #   PathAlignCritic disables itself when local path blocked, so
+    #   ObstaclesCritic takes over for soft deflection.
+    #
+    # Previous attempts:
+    # - DWB: rejected 251/251 trajectories in 12 successive runs (sampling
+    #   model rejected by tight environment + WebRTC TF jitter)
+    # - RPP: passed doorways once but couldn't react to obstacles (path-
+    #   tracker, no avoidance) — required custom_controller.py veto layer
+    # - custom_controller.py (DimOS pure-pursuit): worked once at 13:31
+    #   on 2026-05-06, not repeatable; 506 lines of unmaintainable Python
+    #
+    # MPPI parameters tuned for Go2 narrow-passage from Nav2 docs +
+    # community examples. KEY tuning rule per Macenski Tuning Guide:
+    # ObstaclesCritic.cost_weight should NOT be too high or robot jitters
+    # in narrow corridors — keep at 4.0 for "soft" deflection, use
+    # critical_weight: 20.0 for near-collision spike behavior.
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: True
-      min_vel_x: 0.0
-      min_vel_y: 0.0
-      max_vel_x: 3.0 #changed
-      max_vel_y: 0.0
-      max_vel_theta: 3.0 #changed
-      min_speed_xy: 0.0
-      max_speed_xy: 3.0 #changed
-      min_speed_theta: 0.0
-      # Add high threshold velocity for turtlebot 3 issue.
-      # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/issues/75
-      acc_lim_x: 2.5
-      acc_lim_y: 2.5
-      acc_lim_theta: 3.2
-      decel_lim_x: -2.5
-      decel_lim_y: -2.5
-      decel_lim_theta: -3.2
-      vx_samples: 20
-      vy_samples: 20
-      vtheta_samples: 20
-      sim_time: 1.2 #changed
-      linear_granularity: 0.05
-      angular_granularity: 0.025
-      transform_tolerance: 0.2
-      xy_goal_tolerance: 0.3 #changed 
-      trans_stopped_velocity: 0.25
-      short_circuit_trajectory_evaluation: True
-      stateful: True
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
-      PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0
-      GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      model_dt: 0.033              # 1 / controller_frequency = 1/30
+      batch_size: 2000
+      vx_std: 0.2
+      vy_std: 0.0                  # diff-drive — Go2 nieholonomiczny
+      wz_std: 0.4
+      vx_max: 0.4                  # Go2 floor 0.2; cap 0.4 for safety
+      vx_min: 0.0                  # no reversing
+      vy_max: 0.0                  # diff-drive — explicit for parsers
+      wz_max: 1.5
+      ax_max: 3.0
+      ay_max: 3.0
+      az_max: 3.5
+      iteration_count: 1
+      prune_distance: 1.7
+      # Sprint 2 Phase 0 (post-review): 1.5 → 0.3
+      # 1.5s was 15× Nav2 default (0.1s) and far above Macenski's "<0.5s
+      # max safe for noisy TF" guidance — meant MPPI could be planning
+      # trajectories on odom from 1.5s ago = guaranteed collision in narrow
+      # corridor.
+      #
+      # TRADEOFF (review #6): WebRTC TF jitter observed empirically at
+      # 200-700ms. With transform_tolerance: 0.3, ~700ms-stale TF will
+      # cause MPPI to refuse the cycle ("could not transform map→base_link")
+      # → controller starvation visible in /diagnostics. This is INTENTIONAL
+      # diagnostic behavior — better to skip a cycle than collide.
+      # If Phase D shows excessive starvation: try 0.5 (Macenski max safe)
+      # or fix WebRTC TF latency at source (driver-level).
+      transform_tolerance: 0.3
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      visualize: false
+      # Sprint 2 Phase 0 (post-review): enable diagnostic publishers for
+      # Phase D telemetry. publish_optimal_trajectory exposes winning sample
+      # on /controller_server/optimal_trajectory; publish_critic_scores
+      # exposes nav2_msgs/CriticsStats on /controller_server/critic_scores
+      # — proper MPPI rejection rate diagnostic (NOT optimal_trajectory
+      # which is just the chosen one). Both are off by default.
+      #
+      # HUMBLE COMPATIBILITY WARNING (review #5): these params landed in
+      # nav2_mppi_controller in Iron (Aug 2023). For Humble, backport
+      # status is uncertain. Nav2 silently ignores unknown YAML keys,
+      # so worst case is "topics don't exist" not crash. Verify after
+      # first robot boot:
+      #   ros2 topic list | grep controller_server
+      # If topics absent, fall back to logging from controller_server
+      # debug output for MPPI diagnostics.
+      publish_optimal_trajectory: true
+      publish_critic_scores: true
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.0
+      critics: ["ConstraintCritic", "ObstaclesCritic", "GoalCritic",
+                "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+                "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0           # KEEP LOW — high values cause jitter in narrow corridor (Macenski Tuning Guide)
+        critical_weight: 20.0      # Near-collision spike — sharp cost rise <10cm from wall
+        consider_footprint: true
+        collision_cost: 10000.0
+        collision_margin_distance: 0.10
+        near_goal_distance: 0.5
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 12.0          # Lower than current main default (14.0) — lets MPPI deflect from /plan when obstacles block it (note: old docs said 32.0 — Macenski lowered to 14 in Aug 2024)
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
 
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 1.0
-      publish_frequency: 1.0
+      # 5 Hz is the minimum for reactive obstacle avoidance — at 0.5 m/s the
+      # robot advances 10 cm per update, acceptable reaction distance for
+      # pedestrians / pets. 1 Hz was a dead-man's switch (50 cm lag).
+      update_frequency: 5.0
+      publish_frequency: 5.0
       global_frame: odom
       robot_base_frame: base_link
       use_sim_time: False
@@ -190,11 +311,28 @@ local_costmap:
       width: 6
       height: 6
       resolution: 0.05
-      footprint: "[ [0.360, 0.200], [0.360, -0.200], [-0.450, -0.200], [-0.450, 0.200] ]"
+      # B: Rectangular footprint instead of circle. Go2 is 30×65cm; circular
+      # robot_radius=0.20 (=40cm circle) ignored orientation → controller
+      # planned through 60cm doorway as if robot were 40cm circle. With
+      # rectangle, costmap knows robot orientation: 17cm half-width on
+      # short side fits 60cm doorway with 13cm each side clearance.
+      # Format: [[+x,+y],[+x,-y],[-x,-y],[-x,+y]] in base_link frame.
+      footprint: "[[0.33, 0.17], [0.33, -0.17], [-0.33, -0.17], [-0.33, 0.17]]"
+      # ULTRATHINK fix #2: re-enable voxel_layer. Local needs runtime
+      # obstacles for safety. Issue earlier was static_layer:/map_clean
+      # mismatch (cleaned map had shifted walls vs AMCL pose) — fixed below
+      # by pointing local static to /map (raw).
       plugins: ["static_layer", "voxel_layer", "inflation_layer"]
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
+        # CRITICAL fix: local uses RAW map (/map). AMCL localizes against raw
+        # map; controller's local costmap MUST agree with AMCL's mental model.
+        # Earlier we used /map_clean which had shifted walls (expand_free)
+        # → DWB simulating from AMCL pose saw lethal cells where there
+        # shouldn't be → all 819 trajectories rejected. Keep local on raw /map
+        # so live scan, AMCL, and static wall geometry all agree.
+        map_topic: /map
         map_subscribe_transient_local: True
 
       voxel_layer:
@@ -202,6 +340,10 @@ local_costmap:
         enabled: True
         publish_voxel_map: True
         observation_sources: scan
+        # Footprint area always clears to free — kills the "Starting point
+        # in lethal space" class of errors at source. The robot can never
+        # be "in a wall" from its own perspective.
+        footprint_clearing_enabled: true
         scan:
           topic: /scan
           max_obstacle_height: 2.0
@@ -209,57 +351,91 @@ local_costmap:
           marking: True
           data_type: "LaserScan"
           raytrace_max_range: 3.0
-          raytrace_min_range: 0.0
+          # CRITICAL: 0.25 m skip-zone around the lidar so Go2's own body
+          # reflections (legs / head seen by the head-mounted sensor)
+          # don't mark cells right under the footprint as obstacles.
+          raytrace_min_range: 0.25
           obstacle_max_range: 2.5
-          obstacle_min_range: 0.0
+          obstacle_min_range: 0.25
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 1.0
-        inflation_radius: 0.1
+        # Sprint 2 fix: 0.05 → 0.20. Inflation layer provides the soft cost
+        # gradient that lets the controller naturally prefer center-of-corridor
+        # without any custom logic. With 0.05 there was effectively no
+        # gradient — controller had to make hard accept/reject decisions at
+        # the wall edge, which the previous custom pure-pursuit hard-stopped
+        # via "scan blocked" predicate. With MPPI controller (Sprint 2 Phase C)
+        # the gradient drives soft trajectory deflection: ObstaclesCritic
+        # samples thousands of trajectories and prefers low-cost ones, so a
+        # ~0.20m inflation gives 7-tier exponential cost falloff.
+        # 80cm door - 34cm footprint = 23cm clearance/side; 0.20m inflation
+        # creates a gradient through that whole corridor space, peak at wall.
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.20
 
 global_costmap:
   global_costmap:
     ros__parameters:
       update_frequency: 1.0
       publish_frequency: 1.0
-      global_frame: odom
+      # Global costmap lives in the map frame — static_layer subscribes
+      # to /map from nav2_map_server. Requires AMCL publishing map→odom.
+      global_frame: map
       robot_base_frame: base_link
       use_sim_time: False
       resolution: 0.05
-      track_unknown_space: False
+      # Sprint 2 fix: False → True. Inconsistency with planner's
+      # allow_unknown=true on line ~384 — costmap was treating NO_INFORMATION
+      # as FREE (passable) while planner was told it could plan through
+      # unknown. Now both layers agree: costmap distinguishes UNKNOWN
+      # cells, planner is permitted to traverse them. Crucial near doorways
+      # where /scan can produce small UNKNOWN patches at frame edges.
+      track_unknown_space: True
       static_map: True
       width: 500
       height: 500
       origin_x: -250.0 
       origin_y: -250.0
-      footprint: "[ [0.360, 0.200], [0.360, -0.200], [-0.450, -0.200], [-0.450, 0.200] ]"
-      plugins: ["static_layer", "voxel_layer", "inflation_layer"]
+      # Circle model instead of rectangle — a quadruped yaws freely about
+      # base_link, so re-checking corners at every heading makes Nav2
+      # brittle in doorways. 0.34 m ≈ half-diagonal of 0.30×0.65 footprint
+      # minus a sliver (doorways are 75 cm so 2×0.34=0.68 leaves 3.5 cm
+      # clearance each side — tight but passable).
+      footprint: "[[0.33, 0.17], [0.33, -0.17], [-0.33, -0.17], [-0.33, 0.17]]"   # match local rectangular
+      # Removed voxel_layer from global_costmap. Reasoning:
+      # - global_costmap is for path PLANNING (long-horizon, static features).
+      # - local_costmap (with voxel_layer + /scan) handles RUNTIME obstacle
+      #   avoidance in a 6m rolling window — that's where dynamic obstacles
+      #   matter for the controller.
+      # - With voxel_layer in global, every /scan reading gets DOUBLE-marked
+      #   (once via static_layer's transient_local map, once via voxel_layer's
+      #   live scan), creating spurious lethal cells around the robot that
+      #   blocked SmacPlanner2D from finding paths. Removing the duplication
+      #   restored planning.
+      plugins: ["static_layer", "inflation_layer"]
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
+        # User test #19 conclusion: cleaned map's expand_free_into_unknown=0.30m
+        # widened doorways BEYOND real wall positions. Planner planned path
+        # through "fake" door spot, robot's /scan saw real walls there →
+        # collision. Reverting global to raw /map (single-map): doorways are
+        # at real positions, planner has accurate geometry. Trade-off: raw
+        # map has speckle that may complicate planning, but real-wall
+        # accuracy beats fake-door corridors.
+        map_topic: /map
         map_subscribe_transient_local: True
-
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
-        enabled: True
-        publish_voxel_map: True
-        observation_sources: scan
-        scan:
-          topic: scan
-          max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          data_type: "LaserScan"
-          raytrace_max_range: 3.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
-          obstacle_min_range: 0.0
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 1.0
-        inflation_radius: 0.1
+        # Plan-only test 2026-05-04: with inflation_radius=0.05 and smoothing
+        # enabled, Smac produced a nominally legal path with only 0.14 m raw-map
+        # centerline clearance near (0.75, -1.26). Go2 half-width is ~0.17 m,
+        # so that plan physically scrapes walls. 0.22 m keeps a 5 cm margin
+        # over half-width while still fitting through 70 cm doors when centered.
+        cost_scaling_factor: 2.0
+        inflation_radius: 0.22
 
 map_server:
   ros__parameters:
@@ -279,40 +455,60 @@ map_saver:
 planner_server:
   ros__parameters:
     planner_plugins: ["GridBased"]
-    use_sim_time: True
+    # Real robot, no /clock publisher — planner must use wall clock or it
+    # stalls forever waiting for ticks that never arrive.
+    use_sim_time: False
 
     GridBased:
-      plugin: "nav2_smac_planner/SmacPlannerHybrid"
-      tolerance: 3.0                            # tolerance for planning if unable to reach exact pose, in meters
-      downsample_costmap: false                 # whether or not to downsample the map
-      downsampling_factor: 1                    # multiplier for the resolution of the costmap layer (e.g. 2 on a 5cm costmap would be 10cm)
-      allow_unknown: false                      # allow traveling in unknown space
-      max_iterations: 1000000                   # maximum total iterations to search for before failing (in case unreachable), set to -1 to disable
-      max_on_approach_iterations: 1000          # maximum number of iterations to attempt to reach goal once in tolerance
-      max_planning_time: 3.5                    # max time in s for planner to plan, smooth, and upsample. Will scale maximum smoothing and upsampling times based on remaining time after planning.
-      motion_model_for_search: "REEDS_SHEPP"    # For Hybrid Dubin, Reeds-Shepp
-      cost_travel_multiplier: 2.0               # For 2D: Cost multiplier to apply to search to steer away from high cost areas. Larger values will place in the center of aisles more exactly (if non-`FREE` cost potential field exists) but take slightly longer to compute. To optimize for speed, a value of 1.0 is reasonable. A reasonable tradeoff value is 2.0. A value of 0.0 effective disables steering away from obstacles and acts like a naive binary search A*.
-      angle_quantization_bins: 64               # For Hybrid nodes: Number of angle bins for search, must be 1 for 2D node (no angle search)
-      analytic_expansion_ratio: 3.5             # For Hybrid/Lattice nodes: The ratio to attempt analytic expansions during search for final approach.
-      analytic_expansion_max_length: 3.0        # For Hybrid/Lattice nodes: The maximum length of the analytic expansion to be considered valid to prevent unsafe shortcutting (in meters). This should be scaled with minimum turning radius and be no less than 4-5x the minimum radius
-      minimum_turning_radius: 0.30              # For Hybrid/Lattice nodes: minimum turning radius in m of path / vehicle
-      reverse_penalty: 2.1                      # For Reeds-Shepp model: penalty to apply if motion is reversing, must be => 1
-      change_penalty: 0.0                       # For Hybrid nodes: penalty to apply if motion is changing directions, must be >= 0
-      non_straight_penalty: 1.20                # For Hybrid nodes: penalty to apply if motion is non-straight, must be => 1
-      cost_penalty: 1.5                         # For Hybrid nodes: penalty to apply to higher cost areas when adding into the obstacle map dynamic programming distance expansion heuristic. This drives the robot more towards the center of passages. A value between 1.3 - 3.5 is reasonable.
-      retrospective_penalty: 0.025              # For Hybrid/Lattice nodes: penalty to prefer later maneuvers before earlier along the path. Saves search time since earlier nodes are not expanded until it is necessary. Must be >= 0.0 and <= 1.0
-      rotation_penalty: 4.0                     # For Lattice node: Penalty to apply only to pure rotate in place commands when using minimum control sets containing rotate in place primitives. This should always be set sufficiently high to weight against this action unless strictly necessary for obstacle avoidance or there may be frequent discontinuities in the plan where it requests the robot to rotate in place to short-cut an otherwise smooth path for marginal path distance savings.
-      lookup_table_size: 20.0                   # For Hybrid nodes: Size of the dubin/reeds-sheep distance window to cache, in meters.
-      cache_obstacle_heuristic: True            # For Hybrid nodes: Cache the obstacle map dynamic programming distance expansion heuristic between subsiquent replannings of the same goal location. Dramatically speeds up replanning performance (40x) if costmap is largely static.  
-      allow_reverse_expansion: False            # For Lattice nodes: Whether to expand state lattice graph in forward primitives or reverse as well, will double the branching factor at each step.   
-      smooth_path: True                         # For Lattice/Hybrid nodes: Whether or not to smooth the path, always true for 2D nodes.
+      # SmacPlanner2D: pure grid A*, ignores kinematic constraints.
+      # The previous SmacPlannerHybrid with motion_model=REEDS_SHEPP was
+      # designed for Ackermann-style cars that cannot turn in place —
+      # combined with minimum_turning_radius=0.30m it refused to produce
+      # plans in our ~75 cm indoor doorways, leaving bt_navigator stuck
+      # in "spin as recovery" loops. Go2 is a quadruped that rotates
+      # freely about base_link, so pure grid A* is both simpler and
+      # strictly more permissive.
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.3                            # reach goal within 30 cm — good enough for home navigation
+      downsample_costmap: false
+      downsampling_factor: 1
+      # Allow planning through unknown space. Go2's voxel window is only
+      # 6.4 m wide; any goal further than that sits in "unknown" from
+      # our perspective, and we need the planner to route through it
+      # rather than refuse.
+      # Sprint 1B Test 2 (raw map bez auto-clean): raw mapy mają unknown
+      # cells dokładnie przy framugach drzwi — bez allow_unknown=true planner
+      # odmawia planowania ścieżki przez te przejścia. Default false → blocking.
+      allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      # Treat inflated raw-map costs as important. Low values allowed shorter
+      # routes that hugged walls; plan-only clearance gate requires >=0.22 m.
+      cost_travel_multiplier: 8.0
+      # Smac smoothing can cut corners after A*, reducing wall clearance. Keep
+      # grid path geometry for the external pure-pursuit controller.
+      smooth_path: False
       smoother:
         max_iterations: 1000
         w_smooth: 0.3
         w_data: 0.2
         tolerance: 1.0e-10
-        do_refinement: true                     # Whether to recursively run the smoother 3 times on the results from prior runs to refine the results further
     
+lifecycle_manager_navigation:
+  ros__parameters:
+    autostart: true
+    # Sprint 2 fix: re-enable controller_server, smoother_server,
+    # velocity_smoother. Previously disabled because custom_controller.py
+    # (DimOS pure-pursuit) replaced them — Sprint 2 swaps to Nav2 standard
+    # MPPI Controller (configured in controller_server FollowPath section)
+    # which works through narrow doorways out of the box per Macenski 2024.
+    # With controller_server back in lifecycle, the standard Nav2 BT
+    # recovery subtree (Spin / BackUp / ClearCostmap / Wait) finally works
+    # because behavior_server has a controller to bond with.
+    node_names: ["controller_server", "smoother_server", "planner_server", "behavior_server", "bt_navigator", "waypoint_follower", "velocity_smoother"]
+    bond_timeout: 0.0
+
 behavior_server:
   ros__parameters:
     costmap_topic: local_costmap/costmap_raw
@@ -329,10 +525,14 @@ behavior_server:
       plugin: "nav2_behaviors/Wait"
     assisted_teleop:
       plugin: "nav2_behaviors/AssistedTeleop"
-    global_frame: odom
+    # Behaviors operate in map frame so recovery (backup, spin) reasons
+    # about the localized pose, not raw odom (which drifts over a session).
+    global_frame: map
     robot_base_frame: base_link
-    transform_tolerance: 0.1
-    use_sim_time: true
+    # Bumped 0.1 → 1.5 (matches controller_server) — Go2 WebRTC TF latency.
+    transform_tolerance: 1.5
+    # Real robot, no /clock publisher — same story as planner_server above.
+    use_sim_time: False
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
     min_rotational_vel: 0.4
@@ -352,3 +552,71 @@ waypoint_follower:
       plugin: "nav2_waypoint_follower::WaitAtWaypoint"
       enabled: True
       waypoint_pause_duration: 200
+
+# Sprint 2 Phase C: standard Nav2 path smoother (smooths /plan output
+# from SmacPlanner2D before it reaches MPPI controller). Replaces the
+# off-by-default smoother in planner_server's GridBased section.
+# Standard Nav2 defaults — no Go2-specific tuning needed.
+smoother_server:
+  ros__parameters:
+    use_sim_time: False
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+# Sprint 2 Phase C: standard Nav2 cmd_vel rate-limiter. Sits in parallel
+# with /cmd_vel (subscribes /cmd_vel from MPPI, publishes /cmd_vel_smoothed).
+# Driver currently listens directly to /cmd_vel — Sprint 3 will wire the
+# full chain (controller→smoother→collision_monitor→/cmd_vel) via launch
+# file remaps. For Phase C, velocity_smoother runs as monitoring-only
+# (publishes /cmd_vel_smoothed, driver ignores) so lifecycle can activate it.
+# Tuning: max_velocity / max_accel matched to Go2 firmware capability.
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: False
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.5, 0.0, 2.5]
+    min_velocity: [-0.5, 0.0, -2.5]
+    max_accel: [2.5, 0.0, 3.2]
+    max_decel: [-2.5, 0.0, -3.2]
+    odom_topic: "odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+# Sprint 3 stub: nav2_collision_monitor for soft slowdown/stop zones.
+# Not yet wired into cmd_vel chain — requires supervisor changes to spawn
+# the node + launch file remaps for proper topic flow:
+#   controller_server → /cmd_vel_nav (remap)
+#   collision_monitor in=/cmd_vel_nav, out=/cmd_vel
+#   driver subscribes /cmd_vel
+# Reference config (commented out, uncomment + wire in Sprint 3):
+# collision_monitor:
+#   ros__parameters:
+#     base_frame_id: "base_link"
+#     odom_frame_id: "odom"
+#     cmd_vel_in_topic: "cmd_vel_nav"
+#     cmd_vel_out_topic: "cmd_vel"
+#     transform_tolerance: 0.5
+#     source_timeout: 1.0
+#     polygons: ["SlowZone", "StopZone"]
+#     SlowZone:
+#       type: "polygon"
+#       points: "[[0.45, 0.30], [0.45, -0.30], [-0.20, -0.30], [-0.20, 0.30]]"
+#       action_type: "slowdown"
+#       slowdown_ratio: 0.4
+#       min_points: 4
+#     StopZone:
+#       type: "polygon"
+#       points: "[[0.18, 0.18], [0.18, -0.18], [-0.10, -0.18], [-0.10, 0.18]]"
+#       action_type: "stop"
+#       min_points: 4
+#     observation_sources: ["scan"]
+#     scan:
+#       type: "scan"
+#       topic: "/scan"

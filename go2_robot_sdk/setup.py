@@ -56,6 +56,7 @@ setup(
             'go2_driver_node = go2_robot_sdk.go2_driver_node:main',
             'bridge_driver_node = go2_robot_sdk.bridge_driver_node:main',
             'lidar_to_pointcloud = go2_robot_sdk.lidar_to_point:main',
+            'custom_controller = go2_robot_sdk.custom_controller:main',
             'example_nav_through_poses = nav2_simple_commander.example_nav_through_poses:main',
             'demo_security = nav2_simple_commander.demo_security:main',
         ],
