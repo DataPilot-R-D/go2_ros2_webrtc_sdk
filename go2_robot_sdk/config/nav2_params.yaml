@@ -130,11 +130,17 @@ bt_navigator_navigate_to_pose_rclcpp_node:
 controller_server:
   ros__parameters:
     use_sim_time: False
-    # Sprint 2 Phase C: bump 10.0 → 30.0 for MPPI. MPPI is sampling-based
-    # (2000 trajectories/cycle) and benefits from higher frequency for
-    # reactive obstacle avoidance. Macenski 2024 talks: 50Hz typical on
-    # modern CPU; 30Hz safe for ros2_m1_native (Apple Silicon) + Go2 host.
-    controller_frequency: 30.0
+    # Sprint 2 Phase 1 Hetzner validation 2026-05-08 found that
+    # controller_frequency: 30.0 + model_dt: 0.033 fails MPPI configure with
+    # "Controller period more then model dt, set it equal to model dt" because
+    # period = 1/30 = 0.0333... > model_dt = 0.033 (floating-point ε).
+    # Fix: drop to Macenski standard 20Hz + model_dt 0.05 (1/20 = 0.05 exactly).
+    # Empirical verification on cax11 cax11 ARM Hetzner Ubuntu 22.04 + Nav2
+    # Humble 1.1.20: lifecycle CONFIGURE succeeded after this change.
+    # Reactivity tradeoff: 20Hz vs 30Hz means 17ms longer reaction time
+    # (50ms vs 33ms loop). For Go2 at 0.4 m/s this is 7mm vs 13mm of travel
+    # per cycle — both fine for narrow corridor navigation.
+    controller_frequency: 20.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -187,7 +193,7 @@ controller_server:
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
       time_steps: 56
-      model_dt: 0.033              # 1 / controller_frequency = 1/30
+      model_dt: 0.05               # 1 / controller_frequency = 1/20 (exact, no FP ε)
       batch_size: 2000
       vx_std: 0.2
       vy_std: 0.0                  # diff-drive — Go2 nieholonomiczny
