@@ -224,24 +224,19 @@ controller_server:
       temperature: 0.3
       gamma: 0.015
       motion_model: "DiffDrive"
-      visualize: false
-      # Sprint 2 Phase 0 (post-review): enable diagnostic publishers for
-      # Phase D telemetry. publish_optimal_trajectory exposes winning sample
-      # on /controller_server/optimal_trajectory; publish_critic_scores
-      # exposes nav2_msgs/CriticsStats on /controller_server/critic_scores
-      # — proper MPPI rejection rate diagnostic (NOT optimal_trajectory
-      # which is just the chosen one). Both are off by default.
+      # Sprint 2 Phase D Prep / 2026-05-09 Stage A finding (empirical on
+      # real Go2 + Nav2 Humble 1.1.20 M1 native):
+      # `publish_critic_scores` and `publish_optimal_trajectory` were Iron+
+      # additions — NOT in Humble 1.1.20 binary (`ros2 param list` confirms
+      # absent in /controller_server). YAML setting them = silently ignored.
       #
-      # HUMBLE COMPATIBILITY WARNING (review #5): these params landed in
-      # nav2_mppi_controller in Iron (Aug 2023). For Humble, backport
-      # status is uncertain. Nav2 silently ignores unknown YAML keys,
-      # so worst case is "topics don't exist" not crash. Verify after
-      # first robot boot:
-      #   ros2 topic list | grep controller_server
-      # If topics absent, fall back to logging from controller_server
-      # debug output for MPPI diagnostics.
-      publish_optimal_trajectory: true
-      publish_critic_scores: true
+      # Workaround: enable `visualize: true` to publish /trajectories
+      # (visualization_msgs/MarkerArray with sampled MPPI trajectories per
+      # cycle). Phase D rosbag records /trajectories instead of the missing
+      # critic_scores topic. Rejection rate inferred from sample distribution
+      # (TrajectoryVisualizer.trajectory_step controls density) + cmd_vel
+      # patterns + controller_server log parsing.
+      visualize: true
       TrajectoryVisualizer:
         trajectory_step: 5
         time_step: 3
