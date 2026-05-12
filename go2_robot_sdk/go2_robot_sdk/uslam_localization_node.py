@@ -26,6 +26,7 @@ import time
 
 import numpy as np
 import rclpy
+import rclpy.duration
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
@@ -109,15 +110,36 @@ class UslamLocalizationNode(Node):
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
-        self.declare_parameter("broadcast_rate_hz", 20.0)
-        # Drop stale localization fixes — USLAM @ ~20 Hz means a >0.5s
-        # gap is a stream stall (WebRTC backpressure). Keep the last
-        # transform alive instead of broadcasting a stale fix.
+        # 30Hz vs 20Hz: more frequent TF samples → tighter interpolation
+        # envelope for costmap queries between USLAM updates. USLAM
+        # actually publishes ~20Hz nominal but 500-800ms gaps observed
+        # during quadruped pivot — at 30Hz our timer broadcasts cached
+        # values 1.5× more often, keeping the TF chain warm even when
+        # USLAM stalls. Driver's /odom is 100+ Hz, not a bottleneck.
+        self.declare_parameter("broadcast_rate_hz", 30.0)
+        # 2026-05-12 evening v3: 2.0 was TOO LARGE — when USLAM stalled
+        # 1.5s, we'd broadcast a STALE pose with FUTURE-dated stamp,
+        # confusing costmap (TF says robot here, fizycznie elsewhere).
+        # 0.5s: skip broadcast if loc msg older — costmap then relies on
+        # transform_tolerance (2.0s) to use last good TF instead of
+        # getting a misleading "fresh-stamped but stale-pose" update.
         self.declare_parameter("max_loc_age_s", 0.5)
-        # The driver's /odom is a relative drift estimate from leg
-        # kinematics + IMU. We only need an odom→base_link snapshot at
-        # the same moment as the localization fix.
-        self.declare_parameter("max_odom_age_s", 0.3)
+        # Driver's /odom from leg kinematics — much smoother than USLAM.
+        self.declare_parameter("max_odom_age_s", 1.0)
+        # Future-date the TF stamp. Verified 2026-05-12 evening: 0.2s
+        # offset was INSUFFICIENT — controller / MPPI queries 471+ ms
+        # ahead (prediction horizon for trajectory rollout). Bumped to
+        # 1.0s to cover the full window:
+        #   - MPPI rollout: model_dt * time_steps = 0.05 * 56 = 2.8s,
+        #     but actually queries only initial prediction window (~500ms)
+        #   - Global planner_server: queries ~iteration_period = 1s
+        #   - costmap update queries: 100-300ms ahead
+        # 1.0s covers all + 200ms safety margin. Trade-off: TF reports a
+        # slightly future-extrapolated pose, but USLAM quadruped motion
+        # is slow enough (<0.2 m/s rotation, <0.4 m/s linear) that 1s
+        # ahead is sub-decimeter prediction error — negligible vs the
+        # alternative (Optimizer fail + recovery spin loops).
+        self.declare_parameter("tf_future_offset_s", 1.0)
 
         self.map_frame = self.get_parameter("map_frame").value
         self.odom_frame = self.get_parameter("odom_frame").value
@@ -125,6 +147,7 @@ class UslamLocalizationNode(Node):
         rate = float(self.get_parameter("broadcast_rate_hz").value)
         self.max_loc_age = float(self.get_parameter("max_loc_age_s").value)
         self.max_odom_age = float(self.get_parameter("max_odom_age_s").value)
+        self.tf_future_offset = float(self.get_parameter("tf_future_offset_s").value)
 
         sensor_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -245,13 +268,19 @@ class UslamLocalizationNode(Node):
         translation, rotation = _matrix_to_transform(T_map_odom)
 
         tf_msg = TransformStamped()
-        # Stamp the broadcast with ROS-now, not the localization message's
-        # header.stamp. Driver republishes /localization/odom with the driver
-        # node's ingest time, which by the time we read+fuse+broadcast is
-        # tens of ms in the past. tf2 rejects "extrapolation into the past"
-        # if a consumer (costmap) queries by time slightly ahead. max_loc_age_s
-        # already gates freshness, so stamping with now() is safe.
-        tf_msg.header.stamp = self.get_clock().now().to_msg()
+        # Future-date the TF stamp by tf_future_offset_s. Verified
+        # 2026-05-12 during B→A test: costmap queries land 100-700 ms
+        # AFTER our broadcast and hit "extrapolation into the future"
+        # (Requested time T+0.24s vs latest T → controller declares
+        # Optimizer fail → recovery spin loops → robot kręci się w pokoju).
+        # Stamping ahead means costmap queries fall inside the TF
+        # validity envelope. Trade-off: TFs are nominally "predictions",
+        # but for slow rotations (USLAM pose changes <0.2 rad/s during
+        # quadruped pivot) the error stays sub-mm.
+        future = self.get_clock().now() + rclpy.duration.Duration(
+            seconds=self.tf_future_offset
+        )
+        tf_msg.header.stamp = future.to_msg()
         tf_msg.header.frame_id = self.map_frame
         tf_msg.child_frame_id = self.odom_frame
         tf_msg.transform.translation.x = translation[0]

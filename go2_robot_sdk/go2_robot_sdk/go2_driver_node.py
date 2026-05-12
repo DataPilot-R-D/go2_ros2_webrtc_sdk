@@ -538,6 +538,40 @@ class RobotBaseNode(Node):
                     },
                 }))
 
+            # Cold-boot firmware service wake-up: after v1.1.13 OTA (Feb 2026)
+            # the Go2 Pro ships with several services DISABLED by default
+            # (uslam dispatcher, motion_switcher, sport_mode publishers).
+            # Unitree mobile app re-enables them via api_id=1001 ServiceSwitch
+            # on rt/api/robot_state/request — that's the ONLY mechanism we
+            # found that works (DARKNAVY analysis + Unitree SDK2 docs,
+            # 2026-05-12). Without it, our /cmd_vel works but rt/uslam/* and
+            # rt/lf/sportmodestate stay silent → cascade fail.
+            # Set GO2_FIRMWARE_AUTO_WAKE=0 to skip (default ON since this is
+            # idempotent and harmless when services already running).
+            if os.environ.get("GO2_FIRMWARE_AUTO_WAKE", "1") == "1":
+                services_to_wake = (
+                    "sport_mode",
+                    "advanced_sport",
+                    "motion_switcher",
+                    "uslam",
+                    "obstacles_avoid",
+                )
+                for svc in services_to_wake:
+                    svc_id = int(_t.time() * 1000) % 2147483647
+                    dc.send(json.dumps({
+                        "type": "req",
+                        "topic": "rt/api/robot_state/request",
+                        "data": {
+                            "header": {"identity": {"id": svc_id, "api_id": 1001}},
+                            "parameter": json.dumps({"name": svc, "switch": 1}),
+                        },
+                    }))
+                self.get_logger().info(
+                    f"GO2_FIRMWARE_AUTO_WAKE: ServiceSwitch on for "
+                    f"{', '.join(services_to_wake)} (replaces manual "
+                    f"'open Unitree app to wake services' workaround)"
+                )
+
             # USE_USLAM_LOCALIZATION implies skip — default activation
             # would send mapping/start that the LOC KICK below has to undo.
             _skip_activation = (
