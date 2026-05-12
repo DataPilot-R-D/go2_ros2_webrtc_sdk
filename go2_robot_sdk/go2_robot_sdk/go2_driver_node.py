@@ -254,7 +254,12 @@ class RobotBaseNode(Node):
                 qos_profile)
 
         self.timer = self.create_timer(0.1, self.timer_callback)
-        self.timer_lidar = self.create_timer(0.5, self.timer_callback_lidar)
+        # Robot emits ULIDAR_ARRAY @ ~7Hz. Default 0.1s timer extracts all frames
+        # for production Nav2 (better local costmap for dynamic obstacles).
+        # During USLAM mapping save you may want 0.5s to reduce WebRTC load —
+        # set GO2_LIDAR_PUBLISH_PERIOD=0.5 if save failures recur.
+        _lidar_period = float(os.environ.get("GO2_LIDAR_PUBLISH_PERIOD", "0.1"))
+        self.timer_lidar = self.create_timer(_lidar_period, self.timer_callback_lidar)
 
     def timer_callback(self):
         if self.conn_type == 'webrtc':
@@ -462,7 +467,27 @@ class RobotBaseNode(Node):
             if self._video_enabled():
                 # Enable video stream from robot only when explicitly needed.
                 dc.send(json.dumps({"type": "vid", "topic": "", "data": "on"}))
+
+            # Hot topics saturate the WebRTC data channel — same root cause as
+            # the documented "video blocks cmd_vel" issue, just with LIO instead
+            # of video. USLAM frontend/odom emits at ~250 Hz; when subscribed,
+            # outbound traffic dominates the DC and inbound commands get
+            # silently starved (verified 2026-05-12: motion_switcher,
+            # common/enable_logging, localization/start ALL got zero acks
+            # while frontend/odom flowed at full rate).
+            # Skip subscribe entirely when GO2_USLAM_QUIET_MODE=1. We still
+            # listen on localization/odom (~20 Hz) and server_log (sparse).
+            quiet_mode = os.environ.get("GO2_USLAM_QUIET_MODE", "0") == "1"
+            skip_set = {RTC_TOPIC["USLAM_FRONTEND_ODOM"]} if quiet_mode else set()
+            if quiet_mode:
+                self.get_logger().info(
+                    "GO2_USLAM_QUIET_MODE=1: NOT subscribing to "
+                    f"rt/uslam/frontend/odom (~250 Hz spam) to free DC for "
+                    "inbound commands"
+                )
             for topic in RTC_TOPIC.values():
+                if topic in skip_set:
+                    continue
                 dc.send(json.dumps({"type": "subscribe", "topic": topic}))
 
             # Activate Go2's onboard USLAM so we get the persistent
@@ -508,10 +533,17 @@ class RobotBaseNode(Node):
                     },
                 }))
 
-            if os.environ.get("GO2_SKIP_USLAM_ACTIVATION") == "1":
+            # USE_USLAM_LOCALIZATION implies skip — default activation
+            # would send mapping/start that the LOC KICK below has to undo.
+            _skip_activation = (
+                os.environ.get("GO2_SKIP_USLAM_ACTIVATION") == "1"
+                or os.environ.get("GO2_USE_USLAM_LOCALIZATION", "0") == "1"
+            )
+            if _skip_activation:
                 self.get_logger().info(
-                    "USLAM activation SKIPPED (GO2_SKIP_USLAM_ACTIVATION=1): "
-                    "preserving existing robot state (e.g. Unitree-app-built map + localization)"
+                    "USLAM activation SKIPPED "
+                    "(GO2_SKIP_USLAM_ACTIVATION=1 or GO2_USE_USLAM_LOCALIZATION=1): "
+                    "preserving existing robot state or letting LOC KICK handle init"
                 )
                 # SAFETY: if we skipped the activation dance (which included a
                 # motion_switcher('ai') that keeps the robot in gait mode), the
@@ -569,6 +601,200 @@ class RobotBaseNode(Node):
                     "USLAM activation sequence: normal → mapping/start → "
                     "mapping/run_mapping_process → ai (teleop restored)"
                 )
+
+                # Disable Go2 firmware obstacle_avoid — otherwise it silently
+                # filters Nav2's /cmd_vel near walls, causing "Optimizer fail
+                # to compute path" because robot won't move and AMCL pose stays
+                # near obstacle (verified 2026-05-11). Mirrors SKIP_USLAM branch.
+                if os.environ.get("GO2_DISABLE_OBSTACLE_AVOID", "1") == "1":
+                    oa_id = int(_t.time() * 1000) % 2147483647
+                    dc.send(json.dumps({
+                        "type": "req",
+                        "topic": "rt/api/obstacles_avoid/request",
+                        "data": {
+                            "header": {"identity": {"id": oa_id, "api_id": 1001}},
+                            "parameter": json.dumps({"enable": False}),
+                        },
+                    }))
+                    self.get_logger().info(
+                        "Sent obstacle_avoid disable (api_id=1001) — Nav2 "
+                        "cmd_vel will pass through robot firmware"
+                    )
+
+            # USLAM localization kick — minimal "engage AMCL on saved map"
+            # sequence for the case where we want /localization/odom flowing
+            # so that uslam_localization_node can publish map→odom TF
+            # (alternative to nav2_amcl). Without explicit start, USLAM only
+            # auto-enables after StandUp on an app-built map; on a static
+            # map loaded via go2-supervisor that condition isn't reached.
+            #
+            # Gated by GO2_USLAM_LOCALIZATION_KICK=1 (default off — keeps
+            # current AMCL-based flow untouched). Idempotent: localization/
+            # start is a no-op if already running per USLAM protocol.
+            if os.environ.get("GO2_USLAM_LOCALIZATION_KICK") == "1":
+                import asyncio
+
+                # Optional explicit initial pose: USLAM otherwise carries
+                # whatever pose it had at last shutdown (often stale from a
+                # previous session). Format: GO2_USLAM_INITIAL_POSE="x,y,yaw"
+                # in metres + radians, e.g. "0,0,0" when robot is placed at
+                # map origin, or "1.5,-2.0,1.5708" for a non-origin start.
+                init_pose_raw = os.environ.get(
+                    "GO2_USLAM_INITIAL_POSE", ""
+                ).strip()
+                init_pose_xyz_yaw: tuple[float, float, float] | None = None
+                if init_pose_raw:
+                    try:
+                        parts = [p.strip() for p in init_pose_raw.split(",")]
+                        if len(parts) != 3:
+                            raise ValueError("need exactly 3 comma-separated values")
+                        init_pose_xyz_yaw = (
+                            float(parts[0]), float(parts[1]), float(parts[2])
+                        )
+                    except (ValueError, IndexError) as e:
+                        # Don't silently fall through: a malformed pose makes
+                        # this test pointless. Log loudly and skip the hint.
+                        self.get_logger().error(
+                            f"USLAM LOC KICK: invalid GO2_USLAM_INITIAL_POSE "
+                            f"={init_pose_raw!r} (expected 'x,y,yaw'): {e}. "
+                            f"Proceeding WITHOUT initial pose hint — USLAM may "
+                            f"converge on stale pose from prior session."
+                        )
+
+                async def _uslam_loc_kick():
+                    def _cmd(c: str) -> None:
+                        self.get_logger().info(f"USLAM LOC KICK: >>> {c}")
+                        dc.send(json.dumps({"type": "msg",
+                                            "topic": RTC_TOPIC["USLAM_CMD"],
+                                            "data": c}))
+
+                    def _motion(name: str) -> None:
+                        ms_id = int(_t.time() * 1000) % 2147483647
+                        self.get_logger().info(f"USLAM LOC KICK: motion_switcher -> {name!r}")
+                        dc.send(json.dumps({
+                            "type": "req",
+                            "topic": "rt/api/motion_switcher/request",
+                            "data": {
+                                "header": {"identity": {"id": ms_id, "api_id": 1002}},
+                                "parameter": json.dumps({"name": name}),
+                            },
+                        }))
+
+                    # Wait for robot to settle post-stand. USLAM rejects
+                    # commands during the "ai" mode transition window.
+                    await asyncio.sleep(4.0)
+
+                    # State cleanup — Go2 USLAM keeps persistent state across
+                    # power cycles (verified 2026-05-12: power-cycle does NOT
+                    # clear stuck state). If the previous session ended
+                    # mid-localization or mid-mapping, fresh commands get
+                    # silently dropped. Tear it down explicitly.
+                    #
+                    # USLAM only accepts commands in 'normal' or 'mcf' mode —
+                    # in 'ai' (sport) mapping/* and localization/* are silently
+                    # dropped. Switch to normal for the whole cleanup+start
+                    # sequence, then back to 'ai' for /cmd_vel teleop.
+                    _motion("normal")
+                    await asyncio.sleep(1.5)
+
+                    # enable_logging FIRST — without it server_log stays silent
+                    # and every other command "appears" no-op. Retry up to 3
+                    # times because the data channel may still be stabilizing
+                    # in the first seconds and the first send can be dropped.
+                    for attempt in range(3):
+                        _cmd("common/enable_logging")
+                        await asyncio.sleep(1.2)
+                        # If we already saw any server_log echo, enable_logging
+                        # took effect. _inspect_uslam_msg increments
+                        # _uslam_inspect_count[server_log] on every msg.
+                        seen = self._uslam_inspect_count.get(
+                            RTC_TOPIC["USLAM_SERVER_LOG"], 0
+                        ) if hasattr(self, "_uslam_inspect_count") else 0
+                        if seen > 0:
+                            self.get_logger().info(
+                                f"USLAM LOC KICK: server_log live (attempt {attempt+1}, "
+                                f"{seen} echoes)"
+                            )
+                            break
+                    else:
+                        self.get_logger().warning(
+                            "USLAM LOC KICK: server_log STILL silent after 3 "
+                            "enable_logging attempts — commands likely no-op"
+                        )
+
+                    # Clear any stuck state from previous session.
+                    _cmd("localization/stop")
+                    await asyncio.sleep(1.0)
+                    _cmd("mapping/cancel")
+                    await asyncio.sleep(1.0)
+
+                    # Now the real start sequence. Retry up to 3 times — if
+                    # /localization/odom starts publishing in between, break.
+                    for attempt in range(3):
+                        _cmd("localization/start")
+                        await asyncio.sleep(1.5)
+                        if getattr(self, "_last_localization_odom_pose", None) is not None:
+                            self.get_logger().info(
+                                f"USLAM LOC KICK: localization/start took effect on attempt {attempt+1}"
+                            )
+                            break
+
+                    # Initial pose hint — equivalent of AMCL's /initialpose.
+                    # Per protocol: set_initial_pose_type first (semantics
+                    # unclear but 0 is the documented default), THEN the
+                    # pose. localization/get_status afterwards lets us see
+                    # in server_log whether USLAM accepted the hint.
+                    if init_pose_xyz_yaw is not None:
+                        x0, y0, yaw0 = init_pose_xyz_yaw
+                        _cmd("localization/set_initial_pose_type/0")
+                        await asyncio.sleep(1.0)
+                        _cmd(f"localization/set_initial_pose/{x0}/{y0}/{yaw0}")
+                        await asyncio.sleep(1.5)
+                        _cmd("localization/get_status")
+                        await asyncio.sleep(1.0)
+                        self.get_logger().info(
+                            f"USLAM LOC KICK: initial pose hint applied "
+                            f"x={x0} y={y0} yaw={yaw0} — expect "
+                            f"/localization/odom @ ~20Hz converging on it"
+                        )
+                    else:
+                        self.get_logger().info(
+                            "USLAM LOC KICK: sent localization/start — "
+                            "expect /localization/odom @ ~20Hz within a few "
+                            "seconds (no initial pose hint, USLAM uses "
+                            "stored/auto pose)"
+                        )
+
+                    # Restore 'ai' (sport/gait) mode so /cmd_vel teleop and
+                    # Nav2 controller can drive the robot. USLAM keeps
+                    # localizing in either mode — only mapping/* requires
+                    # 'normal'. Without this the dog won't respond to Move.
+                    _motion("ai")
+                    await asyncio.sleep(1.0)
+
+                    # Watchdog: poll for a /localization/odom sample over the
+                    # next 10s. _cache_pose stores into _last_localization_odom_pose
+                    # whenever the WebRTC channel emits a fix. If still None
+                    # after the window, USLAM silently rejected the kick.
+                    for _ in range(20):  # 20 × 0.5s = 10s
+                        await asyncio.sleep(0.5)
+                        if getattr(self, "_last_localization_odom_pose", None) is not None:
+                            p = self._last_localization_odom_pose
+                            self.get_logger().info(
+                                f"USLAM LOC KICK: /localization/odom is live "
+                                f"pose=({p[0]:.3f}, {p[1]:.3f}, yaw={p[2]:.3f})"
+                            )
+                            return
+                    self.get_logger().error(
+                        "USLAM LOC KICK: NO /localization/odom samples after 10s "
+                        "despite cleanup + retry. Most likely cause: no saved "
+                        "map onboard (localization/start needs a stored PCD). "
+                        "Check rt/uslam/server_log content in driver log. "
+                        "uslam_localization_node will hold map→odom TF silent "
+                        "until samples arrive."
+                    )
+
+                asyncio.get_event_loop().create_task(_uslam_loc_kick())
 
             # PROBE LOCALIZATION + NAVIGATION: comprehensive test of whether
             # localization/* and navigation/set_goal_pose actually work via
@@ -716,50 +942,89 @@ class RobotBaseNode(Node):
             # then download and compare. If Go2 accepts the push, downloads of
             # map.pcd after will match what we sent. Safe because we upload the
             # exact file we downloaded (idempotent overwrite).
-            # Gated by GO2_PROBE_UPLOAD_MAP=1. Path: GO2_PROBE_UPLOAD_PATH.
+            # Gated by GO2_PROBE_UPLOAD_MAP=1.
+            # Single-file mode: GO2_PROBE_UPLOAD_PATH + GO2_PROBE_UPLOAD_TARGET.
+            # Triple-file mode (USLAM map = pcd+pgm+txt): GO2_PROBE_UPLOAD_DIR
+            # pointing to a directory containing the three files. Filenames
+            # in the dir can be either "map.{pcd,pgm,txt}" or
+            # "fresh_map.{pcd,pgm,txt}" (anything else with the right ext).
+            # Target names are always "map.pcd" / "map.pgm" / "map.txt" since
+            # that's what USLAM expects when localization/start loads them.
             if os.environ.get("GO2_PROBE_UPLOAD_MAP") == "1":
                 import asyncio
                 conn_ref = self.conn[robot_num]
+                upload_dir = os.environ.get("GO2_PROBE_UPLOAD_DIR", "").strip()
                 upload_src = os.environ.get(
                     "GO2_PROBE_UPLOAD_PATH", "/tmp/go2-probe/dom_map.pcd")
                 target_name = os.environ.get("GO2_PROBE_UPLOAD_TARGET", "map.pcd")
 
-                async def _probe_upload():
-                    await asyncio.sleep(5.0)
+                async def _send_one(src_path: str, tgt_name: str) -> bool:
                     try:
-                        with open(upload_src, "rb") as f:
+                        with open(src_path, "rb") as f:
                             data = f.read()
                     except Exception as exc:
                         self.get_logger().error(
-                            f"PROBE UPLOAD: open {upload_src} failed: {exc}")
-                        return
+                            f"PROBE UPLOAD: open {src_path} failed: {exc}")
+                        return False
                     self.get_logger().info(
-                        f"PROBE UPLOAD: sending {upload_src} "
-                        f"({len(data)} bytes) -> robot as {target_name}")
+                        f"PROBE UPLOAD: sending {src_path} "
+                        f"({len(data)} bytes) -> robot as {tgt_name}")
                     try:
                         n_chunks = await conn_ref.upload_static_file(
-                            data, target_name)
+                            data, tgt_name)
                         self.get_logger().info(
-                            f"PROBE UPLOAD: all {n_chunks} chunks sent")
+                            f"PROBE UPLOAD: {tgt_name} — all {n_chunks} chunks sent")
+                        return True
                     except Exception as exc:
                         self.get_logger().error(
-                            f"PROBE UPLOAD: send failed: {exc}")
+                            f"PROBE UPLOAD: {tgt_name} send failed: {exc}")
+                        return False
+
+                async def _probe_upload():
+                    await asyncio.sleep(5.0)
+                    if upload_dir:
+                        # Triple-file mode. Find {pcd,pgm,txt} in dir.
+                        import glob
+                        sent_any = False
+                        for ext in ("pcd", "pgm", "txt"):
+                            matches = sorted(glob.glob(f"{upload_dir}/*.{ext}"))
+                            if not matches:
+                                self.get_logger().error(
+                                    f"PROBE UPLOAD: no *.{ext} in {upload_dir}"
+                                )
+                                continue
+                            src = matches[0]
+                            tgt = f"map.{ext}"
+                            ok = await _send_one(src, tgt)
+                            sent_any = sent_any or ok
+                            # Brief pause between files — Go2 firmware commits
+                            # at the end of each push_static_file sequence.
+                            await asyncio.sleep(1.5)
+                        if sent_any:
+                            self.get_logger().info(
+                                "PROBE UPLOAD: triple upload complete — robot "
+                                "should now have our map. Send localization/start "
+                                "next (via GO2_USLAM_LOCALIZATION_KICK or restart)."
+                            )
                         return
-                    # Give robot 3s to commit, then read back.
-                    await asyncio.sleep(3.0)
-                    self.get_logger().info("PROBE UPLOAD: round-trip download")
-                    try:
-                        rt = await conn_ref.download_static_file(
-                            target_name, timeout=60.0)
-                        out = f"/tmp/go2-probe/roundtrip_{target_name}"
-                        os.makedirs("/tmp/go2-probe", exist_ok=True)
-                        with open(out, "wb") as f:
-                            f.write(rt)
-                        self.get_logger().info(
-                            f"PROBE UPLOAD: round-trip -> {out} ({len(rt)} bytes)")
-                    except Exception as exc:
-                        self.get_logger().error(
-                            f"PROBE UPLOAD: round-trip download failed: {exc}")
+
+                    # Single-file legacy mode
+                    if await _send_one(upload_src, target_name):
+                        await asyncio.sleep(3.0)
+                        self.get_logger().info("PROBE UPLOAD: round-trip download")
+                        try:
+                            rt = await conn_ref.download_static_file(
+                                target_name, timeout=60.0)
+                            out = f"/tmp/go2-probe/roundtrip_{target_name}"
+                            os.makedirs("/tmp/go2-probe", exist_ok=True)
+                            with open(out, "wb") as f:
+                                f.write(rt)
+                            self.get_logger().info(
+                                f"PROBE UPLOAD: round-trip -> {out} "
+                                f"({len(rt)} bytes)")
+                        except Exception as exc:
+                            self.get_logger().error(
+                                f"PROBE UPLOAD: round-trip download failed: {exc}")
 
                 asyncio.get_event_loop().create_task(_probe_upload())
 
@@ -890,6 +1155,11 @@ class RobotBaseNode(Node):
                     await asyncio.sleep(2.0)
                     _cmd("mapping/cancel")
                     await asyncio.sleep(2.5)
+                    # Delete stored map file so common/get_map_file doesn't
+                    # return a previous session's commit. mapping/cancel only
+                    # clears WIP; stored files persist until explicit delete.
+                    _cmd("common/delete_map_file")
+                    await asyncio.sleep(2.0)
                     _ms("normal")
                     await asyncio.sleep(1.5)
                     _cmd("mapping/start")
@@ -1410,15 +1680,24 @@ class RobotBaseNode(Node):
             self._uslam_inspect_count = {}
         n = self._uslam_inspect_count.get(topic, 0) + 1
         self._uslam_inspect_count[topic] = n
+        data = msg.get("data")
+        # Log full server_log strings during startup (first 20 — covers full
+        # localization init dance), then sample every 100th to avoid log
+        # explosion during navigation when server_log can burst at 50+ msg/s.
+        # These strings carry command echoes + /success or /fail/<reason>
+        # responses critical for debugging USLAM rejections.
+        if topic.endswith("server_log") and isinstance(data, str):
+            if n <= 20 or n % 100 == 0:
+                self.get_logger().info(f"USLAM server_log #{n}: {data!r}")
+            return
         if n <= 3 or n % 100 == 0:
-            data = msg.get("data")
             if isinstance(data, dict):
                 preview = {
                     k: (v if not isinstance(v, (list, dict)) else f"{type(v).__name__}(len={len(v)})")
                     for k, v in data.items()
                 }
             else:
-                preview = f"type={type(data).__name__}"
+                preview = f"type={type(data).__name__} val={data!r}"
             self.get_logger().info(
                 f"USLAM msg #{n} on {topic}: {preview}"
             )
