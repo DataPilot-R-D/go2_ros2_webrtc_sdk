@@ -88,6 +88,11 @@ class RobotBaseNode(Node):
         self.get_logger().info(f"Connection mode is {self.conn_mode}")
 
         self.conn = {}
+        # Captured in connect_robot (async context) — used by on_validated
+        # and other callbacks to schedule coroutines without relying on
+        # asyncio.get_event_loop() which is deprecated in 3.12+ and raises
+        # when called from threads without a running loop.
+        self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._dc_send_lock = threading.Lock()
         self._dc_outbox = []
         self._dc_delayed_outbox = []
@@ -680,9 +685,25 @@ class RobotBaseNode(Node):
                             },
                         }))
 
-                    # Wait for robot to settle post-stand. USLAM rejects
-                    # commands during the "ai" mode transition window.
-                    await asyncio.sleep(4.0)
+                    # Wait for actual bidirectional DC readiness instead of
+                    # a blind sleep. Today's session showed commands silently
+                    # dropped after a 4s wait — the first send went out
+                    # before peer's subscribe handlers were wired. Gate on
+                    # a positive signal: DC open AND at least one inbound
+                    # msg observed (proves the peer is publishing, which
+                    # implies subscribe sets were processed and inbound
+                    # handlers are live). 6s ceiling as fallback.
+                    for _ in range(60):  # 60 × 0.1s = 6s
+                        if dc.readyState == "open" and getattr(
+                            self, "_uslam_inspect_count", {}
+                        ):
+                            break
+                        await asyncio.sleep(0.1)
+                    else:
+                        self.get_logger().warning(
+                            "USLAM LOC KICK: DC handshake timeout (6s) — "
+                            "proceeding anyway, kick may silently fail"
+                        )
 
                     # State cleanup — Go2 USLAM keeps persistent state across
                     # power cycles (verified 2026-05-12: power-cycle does NOT
@@ -794,7 +815,7 @@ class RobotBaseNode(Node):
                         "until samples arrive."
                     )
 
-                asyncio.get_event_loop().create_task(_uslam_loc_kick())
+                self._asyncio_loop.create_task(_uslam_loc_kick())
 
             # PROBE LOCALIZATION + NAVIGATION: comprehensive test of whether
             # localization/* and navigation/set_goal_pose actually work via
@@ -936,7 +957,7 @@ class RobotBaseNode(Node):
                     await asyncio.sleep(1.5)
                     self.get_logger().info("LOC PROBE: done")
 
-                asyncio.get_event_loop().create_task(_probe_localization())
+                self._asyncio_loop.create_task(_probe_localization())
 
             # PROBE UPLOAD ROUND-TRIP: upload a local .pcd back to the robot,
             # then download and compare. If Go2 accepts the push, downloads of
@@ -1026,7 +1047,7 @@ class RobotBaseNode(Node):
                             self.get_logger().error(
                                 f"PROBE UPLOAD: round-trip download failed: {exc}")
 
-                asyncio.get_event_loop().create_task(_probe_upload())
+                self._asyncio_loop.create_task(_probe_upload())
 
             # PROBE READ-ONLY: download the 3 map files via rtc_inner_req
             # WITHOUT sending any mapping/* commands. Safe on a robot that is
@@ -1078,7 +1099,7 @@ class RobotBaseNode(Node):
                             with open(summary_path, "w") as f:
                                 json.dump(summary, f, indent=2, sort_keys=True)
                     self.get_logger().info(f"PROBE RO: summary {summary_path}")
-                asyncio.get_event_loop().create_task(_probe_readonly())
+                self._asyncio_loop.create_task(_probe_readonly())
 
             # PROBE: one-shot map download. mapping/stop → common/get_map_file
             # → request_static_file. Gated by GO2_PROBE_GET_MAP=1.
@@ -1107,7 +1128,7 @@ class RobotBaseNode(Node):
                         except Exception as exc:
                             self.get_logger().error(f"PROBE: {file_path} failed: {exc}")
 
-                asyncio.get_event_loop().create_task(_probe_download_map())
+                self._asyncio_loop.create_task(_probe_download_map())
 
             # FRESH MAPPING PROBE (with logging): test if mapping/* commands
             # now work differently when common/enable_logging is sent first.
@@ -1209,7 +1230,7 @@ class RobotBaseNode(Node):
                     except FileNotFoundError:
                         pass
 
-                asyncio.get_event_loop().create_task(_fresh_mapping_probe())
+                self._asyncio_loop.create_task(_fresh_mapping_probe())
 
             # MULTI-MAP PROBE: use common/set_map_id to force a fresh slot before
             # starting a new mapping session. Also enables USLAM verbose logging
@@ -1293,7 +1314,7 @@ class RobotBaseNode(Node):
                     except FileNotFoundError:
                         pass
 
-                asyncio.get_event_loop().create_task(_multimap_probe())
+                self._asyncio_loop.create_task(_multimap_probe())
 
             # MAPPING SESSION: keep mapping active, download when operator says so.
             # Flow: operator teleops (physical pilot recommended), robot maps continuously,
@@ -1398,7 +1419,7 @@ class RobotBaseNode(Node):
                     self.get_logger().info(
                         f"MAPPING: session done. Files in {out_dir}/final_*.")
 
-                asyncio.get_event_loop().create_task(_mapping_session())
+                self._asyncio_loop.create_task(_mapping_session())
 
     async def on_video_frame(self, track: MediaStreamTrack, robot_num):
         logger.info(f"Video frame loop starting for robot {robot_num}")
@@ -1981,6 +2002,13 @@ class RobotBaseNode(Node):
 
     async def connect_robot(self, robot_ip, robot_num, token):
         """Connect a single robot via WebRTC. Must be called before spin starts."""
+        # Capture the asyncio loop running this coroutine so callbacks
+        # (on_validated, on_data_channel_message) can schedule tasks on
+        # it without get_event_loop() — which is deprecated in 3.12+ and
+        # ambiguous when called from non-asyncio threads.
+        if self._asyncio_loop is None:
+            self._asyncio_loop = asyncio.get_running_loop()
+
         conn = Go2Connection(
             robot_ip=robot_ip,
             robot_num=robot_num,
