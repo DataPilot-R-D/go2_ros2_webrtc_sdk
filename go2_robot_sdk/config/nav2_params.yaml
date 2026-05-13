@@ -224,12 +224,26 @@ controller_server:
       simulate_ahead_time: 1.0
       rotate_to_goal_heading: false        # don't enforce final yaw
       # ---- MPPI primary_controller params (cascade through shim) ----
-      time_steps: 56
+      # 2026-05-13 PM live-tune (community + Issue #5375 + LP-MPPI paper):
+      # batch_size 2000→800, wz_std 0.4→0.15, temperature 0.3→0.15 — all
+      # aim to KILL ZIGZAG visible on yesterday's tests (1.84 Hz lateral
+      # oscillation, 0.34m Y-range while plan was y=0.25 straight line).
+      # White-noise sampling creates high-freq chatter; smaller batch +
+      # lower noise = more deterministic forward driving.
+      #
+      # 2026-05-13 PM v2 last-attempt POST-MORTEM: tried time_steps 56→30
+      # for "tighter response", but at 0.4 m/s × 30 × 0.05s = 0.6m horizon
+      # MPPI couldn't see THROUGH the 0.5m-thick doorway → robot stopped
+      # mid-corridor at x=1.55 (50% of A→B). Issue #5375's "25-30" was for
+      # CLOSE MANEUVERING goals, NOT narrow-passage transit. Reverted to
+      # 50 = 1.0m horizon (sees full doorway depth) while keeping anti-
+      # zigzag changes (batch + wz_std + temperature).
+      time_steps: 50
       model_dt: 0.05               # 1 / 20Hz (exact, no FP ε)
-      batch_size: 2000
+      batch_size: 800
       vx_std: 0.2
       vy_std: 0.0                  # diff-drive — Go2 nieholonomiczny
-      wz_std: 0.4
+      wz_std: 0.15
       vx_max: 0.4                  # Go2 floor 0.2; cap 0.4 for safety
       # 2026-05-13 multi-agent val: 0.0 → -0.15. Agent A — Nav2 default
       # vx_min=-0.35, our -0.15 is conservative. Pairs with PreferForward
@@ -256,7 +270,10 @@ controller_server:
       # tf_future_offset_s=1.0 in uslam_localization, TF valid window
       # is [latest, latest+1.0s]; tolerance 2.0s covers any stale.
       transform_tolerance: 2.0
-      temperature: 0.3
+      # 2026-05-13 PM: 0.3 → 0.15. Sharper argmin selection between
+      # trajectory samples (less softmax smoothing) = more deterministic
+      # MPPI pick = less cycle-to-cycle wobble.
+      temperature: 0.15
       gamma: 0.015
       motion_model: "DiffDrive"
       # Sprint 2 Phase D Prep / 2026-05-09 Stage A finding (empirical on
@@ -299,15 +316,13 @@ controller_server:
         # finding feasible trajectories for the return leg (cel z tyłu
         # robota → wymagałoby cofać lub rotate). Reduced to 0.0.
         #
-        # 2026-05-13 multi-agent val: 0.0 → 0.5 paired with vx_min=-0.15.
-        # Agent A: with reverse now enabled (vx_min=-0.15), 0.0 weight risks
-        # MPPI picking reverse-by-default on forward-feasible legs (slower
-        # goal acquisition + rocking near goal). Light forward bias (0.5)
-        # keeps forward as preferred when both directions feasible, but
-        # doesn't block the short reverse arcs vx_min=-0.15 enables.
+        # 2026-05-13 PM live-tune: 0.5 too weak — wobble verified visually
+        # AND quantified (0.114m lateral wobble + 1.84 Hz zigzag on A→B).
+        # Bumped to 5.0 (yesterday's working value). Strong forward bias is
+        # critical anti-wobble force in MPPI per community Issue #5375.
         enabled: true
         cost_power: 1
-        cost_weight: 0.5
+        cost_weight: 5.0
         threshold_to_consider: 0.5
       ObstaclesCritic:
         enabled: true
@@ -316,26 +331,34 @@ controller_server:
         critical_weight: 20.0      # Near-collision spike — sharp cost rise <10cm from wall
         consider_footprint: true
         collision_cost: 10000.0
-        # 2026-05-13 multi-agent val: 0.10 → 0.06. Agent A bonus tune. With
-        # 0.10 margin and 0.34m-wide robot in 0.8m doorway, available
-        # clearance is 0.23m per side; 0.10 ate ~half of that, biasing MPPI
-        # away from doorway centerline. 0.06 frees the centerline while
-        # still flagging near-collision via critical_weight=20.0 spike.
-        collision_margin_distance: 0.06
+        # 2026-05-13 PM: REVERTED Agent A's 0.06 → back to 0.10. With 0.06
+        # the robot hit walls during MPPI wobble — 6cm safety buffer + 11cm
+        # lateral wobble = guaranteed contact. 0.10 = 10cm wall buffer that
+        # ObstaclesCritic enforces hard.
+        collision_margin_distance: 0.10
         near_goal_distance: 0.5
       PathAlignCritic:
+        # 2026-05-13 PM "NUKE" — community Issue #5375 + the common fix
+        # for "robot oscillates around plan like windshield wiper".
+        # cost_weight 12 → 2 (heavy reduction) AND offset_from_furthest
+        # 20 → 200 (effectively disable — no waypoint that far ahead, so
+        # critic returns zero gradient). Belt-and-suspenders against
+        # PathAlignCritic being the primary wobble source.
         enabled: true
         cost_power: 1
-        cost_weight: 12.0          # Lower than current main default (14.0) — lets MPPI deflect from /plan when obstacles block it (note: old docs said 32.0 — Macenski lowered to 14 in Aug 2024)
+        cost_weight: 2.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
         threshold_to_consider: 0.5
-        offset_from_furthest: 20
+        offset_from_furthest: 200
         use_path_orientations: false
       PathFollowCritic:
+        # 2026-05-13 PM: 5.0 → 10.0 — with PathAlignCritic nuked, we need
+        # SOMETHING pulling the robot toward the plan. PathFollowCritic
+        # uses heading-toward-plan (not lateral pull) which is wobble-safe.
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
+        cost_weight: 10.0
         offset_from_furthest: 5
         threshold_to_consider: 1.4
       PathAngleCritic:
