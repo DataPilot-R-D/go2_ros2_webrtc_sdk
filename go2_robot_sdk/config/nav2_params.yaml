@@ -164,7 +164,13 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
+      # 2026-05-13 multi-agent val: 0.25 → 0.35. Agent B forensic finding —
+      # L2 B→A reached 0.35m of goal at t+54s, then drifted outside 0.25m
+      # for 1220 samples (90% of remaining 67s). 0.35m tolerance would have
+      # terminated that goal cleanly. With rotate_to_goal_heading=false and
+      # 0.66m-long footprint in 0.8m doorway, 0.35m ≈ half body length is
+      # an honest "close enough" without forcing final pivot in tight space.
+      xy_goal_tolerance: 0.35
       yaw_goal_tolerance: 0.25
 
     # Sprint 2 Phase C controller swap: RotationShim+RegulatedPurePursuit
@@ -209,7 +215,11 @@ controller_server:
       primary_controller: "nav2_mppi_controller::MPPIController"
       angular_dist_threshold: 0.785        # 45° — anything beyond, rotate first
       forward_sampling_distance: 0.5
-      rotate_to_heading_angular_vel: 0.7   # rad/s — gentle for LIO tracking
+      # 2026-05-13 multi-agent val: 0.7 → 0.4. Agent A (9/10 safety, lowest
+      # risk of all proposed tunes): slower pivot reduces USLAM LIO tracking
+      # strain — pivot phase ~doubles (1.1s → 2s) but no failure modes added.
+      # Nav2 default for reference: 1.8.
+      rotate_to_heading_angular_vel: 0.4   # rad/s — gentler for LIO tracking
       max_angular_accel: 1.0
       simulate_ahead_time: 1.0
       rotate_to_goal_heading: false        # don't enforce final yaw
@@ -221,7 +231,12 @@ controller_server:
       vy_std: 0.0                  # diff-drive — Go2 nieholonomiczny
       wz_std: 0.4
       vx_max: 0.4                  # Go2 floor 0.2; cap 0.4 for safety
-      vx_min: 0.0                  # no reversing
+      # 2026-05-13 multi-agent val: 0.0 → -0.15. Agent A — Nav2 default
+      # vx_min=-0.35, our -0.15 is conservative. Pairs with PreferForward
+      # cost_weight=0.5 below to allow short reverse arcs through doorways
+      # without making reverse the default. Critical for B→A return leg
+      # where forward-only kinematic feasibility was the blocker.
+      vx_min: -0.15                # allow short reverse arcs in turns
       vy_max: 0.0                  # diff-drive — explicit for parsers
       wz_max: 1.5
       ax_max: 3.0
@@ -280,15 +295,19 @@ controller_server:
         cost_weight: 3.0
         threshold_to_consider: 0.5
       PreferForwardCritic:
-        # 2026-05-12 B→A: penalty on reverse motion blocked MPPI from
+        # 2026-05-12 B→A: penalty 5.0 on reverse motion blocked MPPI from
         # finding feasible trajectories for the return leg (cel z tyłu
-        # robota → wymagałoby cofać lub rotate). With cost_weight 5.0,
-        # MPPI couldn't reverse-drive AND couldn't pivot-in-place (latter
-        # killed by USLAM drift). 0.0 = no preference; RotationShim
-        # handles initial yaw alignment so forward bias not needed.
+        # robota → wymagałoby cofać lub rotate). Reduced to 0.0.
+        #
+        # 2026-05-13 multi-agent val: 0.0 → 0.5 paired with vx_min=-0.15.
+        # Agent A: with reverse now enabled (vx_min=-0.15), 0.0 weight risks
+        # MPPI picking reverse-by-default on forward-feasible legs (slower
+        # goal acquisition + rocking near goal). Light forward bias (0.5)
+        # keeps forward as preferred when both directions feasible, but
+        # doesn't block the short reverse arcs vx_min=-0.15 enables.
         enabled: true
         cost_power: 1
-        cost_weight: 0.0
+        cost_weight: 0.5
         threshold_to_consider: 0.5
       ObstaclesCritic:
         enabled: true
@@ -297,7 +316,12 @@ controller_server:
         critical_weight: 20.0      # Near-collision spike — sharp cost rise <10cm from wall
         consider_footprint: true
         collision_cost: 10000.0
-        collision_margin_distance: 0.10
+        # 2026-05-13 multi-agent val: 0.10 → 0.06. Agent A bonus tune. With
+        # 0.10 margin and 0.34m-wide robot in 0.8m doorway, available
+        # clearance is 0.23m per side; 0.10 ate ~half of that, biasing MPPI
+        # away from doorway centerline. 0.06 frees the centerline while
+        # still flagging near-collision via critical_weight=20.0 spike.
+        collision_margin_distance: 0.06
         near_goal_distance: 0.5
       PathAlignCritic:
         enabled: true
