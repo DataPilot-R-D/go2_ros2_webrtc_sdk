@@ -83,10 +83,16 @@ RTC_TOPIC = {
     "BASH_REQ": "rt/api/bashrunner/request",
     "SELF_TEST": "rt/selftest",
     "GRID_MAP": "rt/mapping/grid_map",
-    # USLAM = Unitree's onboard SLAM subsystem. Its command topic accepts
-    # JSON {"cmd": "mapping/start|stop|cancel", ...} and enables the full
-    # persistent map stream on rt/uslam/cloud_map + rt/mapping/grid_map.
-    # Without start, Go2 only publishes the 6.4 m local utlidar window.
+    # USLAM = Unitree's onboard SLAM subsystem.
+    #
+    # 2026-05-21 PM REVERT: the rt/utlidar/* topics we switched to this
+    # morning are a SEPARATE feature (radar calibration in Java
+    # RadarInfoActivity), NOT the SLAM command channel. The
+    # DogCmdConstant.RADAR_STANDARD_REQUEST="rt/utlidar/client_command"
+    # name misled us. Decrypted JS bundle main-1af1-JPI.js + store
+    # bundle confirms iA.LIDAR_MAPPING_CMD = "rt/uslam/client_command"
+    # and iA.LIDAR_MAPPING_SERVER_LOG = "rt/uslam/server_log" — the
+    # values legion1581 lib already uses. Reverting both.
     "USLAM_CMD": "rt/uslam/client_command",
     "USLAM_CLOUD_MAP": "rt/uslam/cloud_map",
     # Response + telemetry topics from the USLAM subsystem — subscribing
@@ -117,8 +123,13 @@ DATA_CHANNEL_TYPE = {
     "SUBSCRIBE": "subscribe",
     "UNSUBSCRIBE": "unsubscribe",
     "MSG": "msg",
-    "REQUEST": "request",
-    "RESPONSE": "response",
+    # 2026-05-21 PM FIX per Agent B audit: JS bundle store.C-MxpaM3.js:7045
+    # enum has REQUEST="req" and RESPONSE="res" (3-letter), matching
+    # legion1581 constants.py:8-9. Our "request"/"response" was wrong;
+    # hadn't fired because most paths use MSG, but would break RPC the
+    # moment we relied on local enum.
+    "REQUEST": "req",
+    "RESPONSE": "res",
     "VID": "vid",
     "AUD": "aud",
     "ERR": "err",

@@ -515,7 +515,17 @@ class Go2Connection():
 
         WebRTCVideoChannel.__init__ = _patched_video_init
 
-        self._uwc = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip=self.robot_ip)
+        # 2026-05-22: firmware Go2 >=1.1.15 requires per-device AES-128 key
+        # for data2=3 LAN handshake (legion1581 v2.1.2+). Fetch via:
+        #   examples/fetch_aes_key.py --email ... --sn ... --device-type Go2
+        # Pass via GO2_AES_128_KEY env (32 hex chars). Optional for older
+        # firmware (lib falls back to legacy data2=2 path with static key).
+        _aes_key = os.environ.get("GO2_AES_128_KEY", "").strip() or None
+        _uwc_kwargs = {"ip": self.robot_ip}
+        if _aes_key:
+            _uwc_kwargs["aes_128_key"] = _aes_key
+            logger.info(f"Using GO2_AES_128_KEY ({_aes_key[:8]}...) for data2=3 handshake")
+        self._uwc = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, **_uwc_kwargs)
 
         # Patch: increase DC timeout from 5s to 15s, don't sys.exit
         from unitree_webrtc_connect.webrtc_datachannel import WebRTCDataChannel

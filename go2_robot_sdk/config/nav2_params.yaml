@@ -44,12 +44,8 @@ amcl:
     sigma_hit: 0.2
     tf_broadcast: true
     transform_tolerance: 1.0
-    # Faster updates podczas in-place rotation w wąskim korytarzu:
-    # 0.05 rad ≈ 3° (z 11°) i 0.05m ruchu (z 25cm). Empiryczne 2026-05-11:
-    # przy 180° turn pies pivot-step shifts 10-20cm bocznie — pod default
-    # threshold AMCL nie updateuje, drift accumuluje z /odom.
-    update_min_a: 0.05
-    update_min_d: 0.05
+    update_min_a: 0.2
+    update_min_d: 0.25
     z_hit: 0.5
     z_max: 0.05
     z_rand: 0.1
@@ -71,9 +67,6 @@ bt_navigator:
     odom_topic: odom
     bt_loop_duration: 10
     default_server_timeout: 20
-    # 2026-05-12 evening: TF lookup for goal_updater + checkers can
-    # hit "extrapolation" without tolerance. Match controller_server.
-    transform_tolerance: 1.5
     # 'default_nav_through_poses_bt_xml' and 'default_nav_to_pose_bt_xml' are use defaults:
     # nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml
     # nav2_bt_navigator/navigate_through_poses_w_replanning_and_recovery.xml
@@ -164,13 +157,7 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      # 2026-05-13 multi-agent val: 0.25 → 0.35. Agent B forensic finding —
-      # L2 B→A reached 0.35m of goal at t+54s, then drifted outside 0.25m
-      # for 1220 samples (90% of remaining 67s). 0.35m tolerance would have
-      # terminated that goal cleanly. With rotate_to_goal_heading=false and
-      # 0.66m-long footprint in 0.8m doorway, 0.35m ≈ half body length is
-      # an honest "close enough" without forcing final pivot in tight space.
-      xy_goal_tolerance: 0.35
+      xy_goal_tolerance: 0.25
       yaw_goal_tolerance: 0.25
 
     # Sprint 2 Phase C controller swap: RotationShim+RegulatedPurePursuit
@@ -204,53 +191,15 @@ controller_server:
     # in narrow corridors — keep at 4.0 for "soft" deflection, use
     # critical_weight: 20.0 for near-collision spike behavior.
     FollowPath:
-      # RotationShim WRAPS MPPI: when goal is more than angular_dist_threshold
-      # rad off forward direction, the shim handles initial in-place
-      # rotation cleanly (proper accel limits, doesn't blow USLAM tracking)
-      # before handing off to MPPI for forward-driving. Verified empirically
-      # 2026-05-12 B→A: without shim, MPPI tried to plan reverse-driving
-      # trajectories that PreferForwardCritic kept rejecting → recovery
-      # spin loops → quadruped pivot-step USLAM drift → robot kręci się.
-      plugin: "nav2_rotation_shim_controller::RotationShimController"
-      primary_controller: "nav2_mppi_controller::MPPIController"
-      angular_dist_threshold: 0.785        # 45° — anything beyond, rotate first
-      forward_sampling_distance: 0.5
-      # 2026-05-13 multi-agent val: 0.7 → 0.4. Agent A (9/10 safety, lowest
-      # risk of all proposed tunes): slower pivot reduces USLAM LIO tracking
-      # strain — pivot phase ~doubles (1.1s → 2s) but no failure modes added.
-      # Nav2 default for reference: 1.8.
-      rotate_to_heading_angular_vel: 0.4   # rad/s — gentler for LIO tracking
-      max_angular_accel: 1.0
-      simulate_ahead_time: 1.0
-      rotate_to_goal_heading: false        # don't enforce final yaw
-      # ---- MPPI primary_controller params (cascade through shim) ----
-      # 2026-05-13 PM live-tune (community + Issue #5375 + LP-MPPI paper):
-      # batch_size 2000→800, wz_std 0.4→0.15, temperature 0.3→0.15 — all
-      # aim to KILL ZIGZAG visible on yesterday's tests (1.84 Hz lateral
-      # oscillation, 0.34m Y-range while plan was y=0.25 straight line).
-      # White-noise sampling creates high-freq chatter; smaller batch +
-      # lower noise = more deterministic forward driving.
-      #
-      # 2026-05-13 PM v2 last-attempt POST-MORTEM: tried time_steps 56→30
-      # for "tighter response", but at 0.4 m/s × 30 × 0.05s = 0.6m horizon
-      # MPPI couldn't see THROUGH the 0.5m-thick doorway → robot stopped
-      # mid-corridor at x=1.55 (50% of A→B). Issue #5375's "25-30" was for
-      # CLOSE MANEUVERING goals, NOT narrow-passage transit. Reverted to
-      # 50 = 1.0m horizon (sees full doorway depth) while keeping anti-
-      # zigzag changes (batch + wz_std + temperature).
-      time_steps: 50
-      model_dt: 0.05               # 1 / 20Hz (exact, no FP ε)
-      batch_size: 800
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      model_dt: 0.05               # 1 / controller_frequency = 1/20 (exact, no FP ε)
+      batch_size: 2000
       vx_std: 0.2
       vy_std: 0.0                  # diff-drive — Go2 nieholonomiczny
-      wz_std: 0.15
+      wz_std: 0.4
       vx_max: 0.4                  # Go2 floor 0.2; cap 0.4 for safety
-      # 2026-05-13 multi-agent val: 0.0 → -0.15. Agent A — Nav2 default
-      # vx_min=-0.35, our -0.15 is conservative. Pairs with PreferForward
-      # cost_weight=0.5 below to allow short reverse arcs through doorways
-      # without making reverse the default. Critical for B→A return leg
-      # where forward-only kinematic feasibility was the blocker.
-      vx_min: -0.15                # allow short reverse arcs in turns
+      vx_min: 0.0                  # no reversing
       vy_max: 0.0                  # diff-drive — explicit for parsers
       wz_max: 1.5
       ax_max: 3.0
@@ -264,16 +213,15 @@ controller_server:
       # trajectories on odom from 1.5s ago = guaranteed collision in narrow
       # corridor.
       #
-      # 2026-05-12 evening v3: bumped 1.5 → 2.0 (match local_costmap).
-      # MPPI horizon = model_dt × time_steps = 0.05 × 56 = 2.8s — TF
-      # queries reach a few hundred ms ahead of broadcast. With
-      # tf_future_offset_s=1.0 in uslam_localization, TF valid window
-      # is [latest, latest+1.0s]; tolerance 2.0s covers any stale.
-      transform_tolerance: 2.0
-      # 2026-05-13 PM: 0.3 → 0.15. Sharper argmin selection between
-      # trajectory samples (less softmax smoothing) = more deterministic
-      # MPPI pick = less cycle-to-cycle wobble.
-      temperature: 0.15
+      # TRADEOFF (review #6): WebRTC TF jitter observed empirically at
+      # 200-700ms. With transform_tolerance: 0.3, ~700ms-stale TF will
+      # cause MPPI to refuse the cycle ("could not transform map→base_link")
+      # → controller starvation visible in /diagnostics. This is INTENTIONAL
+      # diagnostic behavior — better to skip a cycle than collide.
+      # If Phase D shows excessive starvation: try 0.5 (Macenski max safe)
+      # or fix WebRTC TF latency at source (driver-level).
+      transform_tolerance: 0.3
+      temperature: 0.3
       gamma: 0.015
       motion_model: "DiffDrive"
       # Sprint 2 Phase D Prep / 2026-05-09 Stage A finding (empirical on
@@ -312,14 +260,6 @@ controller_server:
         cost_weight: 3.0
         threshold_to_consider: 0.5
       PreferForwardCritic:
-        # 2026-05-12 B→A: penalty 5.0 on reverse motion blocked MPPI from
-        # finding feasible trajectories for the return leg (cel z tyłu
-        # robota → wymagałoby cofać lub rotate). Reduced to 0.0.
-        #
-        # 2026-05-13 PM live-tune: 0.5 too weak — wobble verified visually
-        # AND quantified (0.114m lateral wobble + 1.84 Hz zigzag on A→B).
-        # Bumped to 5.0 (yesterday's working value). Strong forward bias is
-        # critical anti-wobble force in MPPI per community Issue #5375.
         enabled: true
         cost_power: 1
         cost_weight: 5.0
@@ -331,34 +271,21 @@ controller_server:
         critical_weight: 20.0      # Near-collision spike — sharp cost rise <10cm from wall
         consider_footprint: true
         collision_cost: 10000.0
-        # 2026-05-13 PM: REVERTED Agent A's 0.06 → back to 0.10. With 0.06
-        # the robot hit walls during MPPI wobble — 6cm safety buffer + 11cm
-        # lateral wobble = guaranteed contact. 0.10 = 10cm wall buffer that
-        # ObstaclesCritic enforces hard.
         collision_margin_distance: 0.10
         near_goal_distance: 0.5
       PathAlignCritic:
-        # 2026-05-13 PM "NUKE" — community Issue #5375 + the common fix
-        # for "robot oscillates around plan like windshield wiper".
-        # cost_weight 12 → 2 (heavy reduction) AND offset_from_furthest
-        # 20 → 200 (effectively disable — no waypoint that far ahead, so
-        # critic returns zero gradient). Belt-and-suspenders against
-        # PathAlignCritic being the primary wobble source.
         enabled: true
         cost_power: 1
-        cost_weight: 2.0
+        cost_weight: 12.0          # Lower than current main default (14.0) — lets MPPI deflect from /plan when obstacles block it (note: old docs said 32.0 — Macenski lowered to 14 in Aug 2024)
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
         threshold_to_consider: 0.5
-        offset_from_furthest: 200
+        offset_from_furthest: 20
         use_path_orientations: false
       PathFollowCritic:
-        # 2026-05-13 PM: 5.0 → 10.0 — with PathAlignCritic nuked, we need
-        # SOMETHING pulling the robot toward the plan. PathFollowCritic
-        # uses heading-toward-plan (not lateral pull) which is wobble-safe.
         enabled: true
         cost_power: 1
-        cost_weight: 10.0
+        cost_weight: 5.0
         offset_from_furthest: 5
         threshold_to_consider: 1.4
       PathAngleCritic:
@@ -376,18 +303,10 @@ local_costmap:
       # 5 Hz is the minimum for reactive obstacle avoidance — at 0.5 m/s the
       # robot advances 10 cm per update, acceptable reaction distance for
       # pedestrians / pets. 1 Hz was a dead-man's switch (50 cm lag).
-      # 2026-05-12 evening v3: 5.0 → 10.0 — local costmap pollowane
-      # częściej daje MPPI świeższy state of dynamic obstacles. Pozwala
-      # też lepiej rozróżnić TF freshness vs actual costmap update lag.
-      update_frequency: 10.0
-      publish_frequency: 10.0
+      update_frequency: 5.0
+      publish_frequency: 5.0
       global_frame: odom
       robot_base_frame: base_link
-      # 10Hz lidar + WebRTC TF jitter (200-700ms) + uslam_localization
-      # 200ms future-offset = potentially 1s+ window of "future-stale" TF
-      # the costmap must accept during quadruped rotation in narrow space.
-      # Raised 1.0 → 2.0 to match controller_server transform_tolerance.
-      transform_tolerance: 2.0
       use_sim_time: False
       rolling_window: true
       width: 6
@@ -432,9 +351,6 @@ local_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
-          # 0.0 = no timeout; without this 10Hz scans can be marked stale
-          # if TF cache is even briefly behind.
-          expected_update_rate: 0.0
           raytrace_max_range: 3.0
           # CRITICAL: 0.25 m skip-zone around the lidar so Go2's own body
           # reflections (legs / head seen by the head-mounted sensor)
@@ -450,16 +366,14 @@ local_costmap:
         # without any custom logic. With 0.05 there was effectively no
         # gradient — controller had to make hard accept/reject decisions at
         # the wall edge, which the previous custom pure-pursuit hard-stopped
-        # 2026-05-12 evening: raised 0.10 → 0.18. Reason: nav2 warned
-        # "configured inflation_radius (0.100) is smaller than computed
-        # inscribed_radius (0.180) of footprint" — local costmap had no
-        # meaningful margin around robot. With 0.18 = inscribed_radius,
-        # local now properly repels from real-time lidar obstacles (e.g.
-        # the doorway frame that scraped the dog on Test 3). Inflated cells
-        # (cost 1-98) are non-blocking so dog can still cut through narrow
-        # passes when needed; just less aggressively.
+        # via "scan blocked" predicate. With MPPI controller (Sprint 2 Phase C)
+        # the gradient drives soft trajectory deflection: ObstaclesCritic
+        # samples thousands of trajectories and prefers low-cost ones, so a
+        # ~0.20m inflation gives 7-tier exponential cost falloff.
+        # 80cm door - 34cm footprint = 23cm clearance/side; 0.20m inflation
+        # creates a gradient through that whole corridor space, peak at wall.
         cost_scaling_factor: 3.0
-        inflation_radius: 0.18
+        inflation_radius: 0.20
 
 global_costmap:
   global_costmap:
@@ -471,10 +385,6 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: False
-      # MISSING transform_tolerance was using default 0.3s → strict TF
-      # extrapolation errors when planner queried during USLAM 500-800ms
-      # gaps (verified 2026-05-12 evening). 2.0 = match local_costmap.
-      transform_tolerance: 2.0
       resolution: 0.05
       # Sprint 2 fix: False → True. Inconsistency with planner's
       # allow_unknown=true on line ~384 — costmap was treating NO_INFORMATION
@@ -520,16 +430,13 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # 2026-05-12 evening final tune: 0.15 too tight (robot scraped wall),
-        # 0.22 too aggressive (robot stuck "przywisił się" near doorway —
-        # MPPI couldn't find feasible trajectory through heavily inflated
-        # corridor centerline). 0.18 = inscribed_radius of footprint —
-        # mathematically the smallest value that protects the robot's own
-        # bounding circle. Sweet spot: planner repels robot from walls
-        # when there's room but leaves enough free centerline for MPPI
-        # to find feasible trajectories through 70cm doorways.
-        cost_scaling_factor: 2.5
-        inflation_radius: 0.18
+        # Plan-only test 2026-05-04: with inflation_radius=0.05 and smoothing
+        # enabled, Smac produced a nominally legal path with only 0.14 m raw-map
+        # centerline clearance near (0.75, -1.26). Go2 half-width is ~0.17 m,
+        # so that plan physically scrapes walls. 0.22 m keeps a 5 cm margin
+        # over half-width while still fitting through 70 cm doors when centered.
+        cost_scaling_factor: 2.0
+        inflation_radius: 0.22
 
 map_server:
   ros__parameters:
@@ -552,10 +459,6 @@ planner_server:
     # Real robot, no /clock publisher — planner must use wall clock or it
     # stalls forever waiting for ticks that never arrive.
     use_sim_time: False
-    # 2026-05-12 evening: planner queries TF for robot pose at plan
-    # start. Default 0.1s tolerance is way too tight for USLAM 500-800ms
-    # gaps. 2.0s = match costmaps.
-    transform_tolerance: 2.0
 
     GridBased:
       # SmacPlanner2D: pure grid A*, ignores kinematic constraints.
@@ -612,13 +515,6 @@ behavior_server:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
-    # BT XML default (navigate_to_pose_w_replanning_and_recovery.xml)
-    # constructs action clients for spin/backup at load-time, so removing
-    # them from plugins makes BT fail to load → "Goal rejected" at every
-    # navigate_to_pose call. Must keep plugins available. To prevent
-    # recovery loops from kręcić-w-kółko: rely on RotationShim + future
-    # TF stamp + larger transform_tolerance (2026-05-12 fixes) to keep
-    # MPPI feasible so recovery never triggers in normal operation.
     behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
     spin:
       plugin: "nav2_behaviors/Spin"
