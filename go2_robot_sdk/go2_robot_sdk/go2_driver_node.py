@@ -40,6 +40,7 @@ from scripts_go2.go2_math import get_robot_joints
 from scripts_go2.go2_camerainfo import load_camera_info
 from scripts_go2.webrtc_driver import Go2Connection
 from go2_robot_sdk.actuator_gate_input import POSTURE_LABEL, GateInput, actuator_mode, joystick_payload
+from go2_robot_sdk.odometry_velocity import body_velocity, sample as pose_sample
 from go2_robot_sdk.received_frames import ReceivedFrames
 
 import rclpy
@@ -174,6 +175,8 @@ class RobotBaseNode(Node):
         # receive time - a stalled source publishes nothing (never a cached copy stamped now).
         self.lidar_frames = ReceivedFrames()
         self.odom_frames = ReceivedFrames()
+        # Codex #279: the previous published pose per robot, from which /odom's twist is derived.
+        self._odom_previous = {}
 
         self.joy_state = Joy()
 
@@ -2040,13 +2043,18 @@ class RobotBaseNode(Node):
 
     def publish_odometry_webrtc(self):
         """ONE received pose -> ONE odom->base_link transform and ONE Odometry, both stamped with its receive time
-        (Codex #274: one coherent sample; a cached pose re-stamped 'now' fabricated fresh TF)."""
+        (Codex #274: one coherent sample; a cached pose re-stamped 'now' fabricated fresh TF). The Odometry's twist
+        is the body-frame velocity DERIVED from this and the previous pose (odometry_velocity, Codex #279); without a
+        valid one (first pose, gap, non-finite) only the TF is published - never a twist claiming a standstill."""
         for i in range(len(self.robot_odom)):
             frame = self.odom_frames.take(str(i))
             if frame is None:
                 continue                                   # no new pose: nothing is re-published
             pose = frame.message['data']['pose']
             stamp = rclpy.time.Time(nanoseconds=frame.received_ns).to_msg()
+            current = pose_sample(frame.received_ns, pose)
+            velocity = body_velocity(self._odom_previous.get(str(i)), current)
+            self._odom_previous = {**self._odom_previous, str(i): current}
             child = "base_link" if self.conn_mode == 'single' else f"robot{str(i)}/base_link"
             odom_trans = TransformStamped()
             odom_trans.header.stamp = stamp
@@ -2060,6 +2068,9 @@ class RobotBaseNode(Node):
             odom_trans.transform.rotation.z = pose['orientation']['z']
             odom_trans.transform.rotation.w = pose['orientation']['w']
             self.broadcaster.sendTransform(odom_trans)
+            if not velocity.valid:
+                self.get_logger().info(f"odometry not published: {velocity.reason}", throttle_duration_sec=5.0)
+                continue
             odom_msg = Odometry()
             odom_msg.header.stamp = stamp
             odom_msg.header.frame_id = 'odom'
@@ -2071,6 +2082,9 @@ class RobotBaseNode(Node):
             odom_msg.pose.pose.orientation.y = pose['orientation']['y']
             odom_msg.pose.pose.orientation.z = pose['orientation']['z']
             odom_msg.pose.pose.orientation.w = pose['orientation']['w']
+            odom_msg.twist.twist.linear.x = velocity.vx       # child (body) frame; covariance all-zero = unknown
+            odom_msg.twist.twist.linear.y = velocity.vy
+            odom_msg.twist.twist.angular.z = velocity.wz
             self.go2_odometry_pub[i].publish(odom_msg)
 
     def publish_lidar_webrtc(self):
