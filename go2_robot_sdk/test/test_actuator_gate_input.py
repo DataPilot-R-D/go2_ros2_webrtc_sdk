@@ -127,12 +127,32 @@ def test_posture_commands_need_a_fresh_gate_status_without_any_lock():
     clock = Clock()
     gi = make(clock)
     assert not gi.motion_allowed()                                  # no gate status ever: refused
+    gi.on_twist(0.0, 0.0, 0.0)
     gi.on_status(_status(["safety_latch"]))
     assert not gi.motion_allowed()
     gi.on_status(_status([]))
     assert gi.motion_allowed()
     clock.t += gate.STATUS_TTL_S                                    # the gate went quiet: refused again
     assert not gi.motion_allowed()
+
+
+def test_an_unlocked_status_without_any_gate_output_refuses_posture():
+    """Codex #191: the status alone is not a live gate."""
+    clock = Clock()
+    gi = make(clock)
+    gi.on_status(_status([]))
+    assert not gi.motion_allowed()
+
+
+def test_a_gate_output_that_expires_while_its_status_is_still_young_refuses_posture():
+    """Codex #191: a stopped gate cannot authorize stand / wake for the rest of the status TTL."""
+    clock = Clock()
+    gi = make(clock)
+    gi.on_twist(0.0, 0.0, 0.0)
+    gi.on_status(_status([]))
+    assert gi.motion_allowed()
+    clock.t += gate.GATE_OUTPUT_TTL_S                               # status still young (< STATUS_TTL_S)
+    assert clock.t - 100.0 < gate.STATUS_TTL_S and not gi.motion_allowed()
 
 
 @pytest.mark.parametrize("raw", ["not json", "[]", json.dumps({"locked_by": "none"}), json.dumps({})])

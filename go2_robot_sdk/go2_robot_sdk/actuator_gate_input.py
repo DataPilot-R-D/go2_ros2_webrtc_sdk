@@ -67,9 +67,10 @@ class GateInput:
         self._status = (self._clock(), free)
 
     def motion_allowed(self) -> bool:
-        """Posture commands (stand up / down, wake up) move the body: only while the gate's own fresh status says
-        no lock is engaged."""
-        return self._status is not None and self._status[1] and self._clock() - self._status[0] < STATUS_TTL_S
+        """Posture commands (stand up / down, wake up) move the body: only while the gate is ALIVE (fresh output,
+        the same TTL as velocity - Codex #191) and its own fresh status says no lock is engaged."""
+        return (self._guard.fresh() and self._status is not None and self._status[1]
+                and self._clock() - self._status[0] < STATUS_TTL_S)
 
     def payload_due(self) -> str | None:
         """The stick state to send this tick (explicit zero when the gate is stale), or None if nothing is due."""
