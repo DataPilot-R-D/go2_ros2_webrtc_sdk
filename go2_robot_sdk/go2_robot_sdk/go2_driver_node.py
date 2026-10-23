@@ -40,8 +40,10 @@ from scripts_go2.go2_math import get_robot_joints
 from scripts_go2.go2_camerainfo import load_camera_info
 from scripts_go2.webrtc_driver import Go2Connection
 from go2_robot_sdk.actuator_gate_input import POSTURE_LABEL, GateInput, actuator_mode, joystick_payload
+from go2_robot_sdk.lidar_frames import LidarFrames
 
 import rclpy
+import rclpy.time
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
@@ -168,6 +170,8 @@ class RobotBaseNode(Node):
         self.robot_low_cmd = {}
         self.robot_sport_state = {}
         self.robot_lidar = {}
+        # T5.9 (Codex #271): each received lidar frame is published once, stamped with its receive time.
+        self.lidar_frames = LidarFrames()
 
         self.joy_state = Joy()
 
@@ -1860,6 +1864,7 @@ class RobotBaseNode(Node):
 
         if msg.get('topic') == RTC_TOPIC["ULIDAR_ARRAY"]:
             self.robot_lidar[robot_num] = msg
+            self.lidar_frames.accept(robot_num, msg, self.get_clock().now().nanoseconds)
 
         if msg.get('topic') == RTC_TOPIC['ROBOTODOM']:
             self.robot_odom[robot_num] = msg
@@ -2094,8 +2099,9 @@ class RobotBaseNode(Node):
         if not hasattr(self, "_lidar_missing_warn_ts"):
             self._lidar_missing_warn_ts = {}
         for i in range(len(self.robot_lidar)):
-            if self.robot_lidar[str(i)]:
-                msg = self.robot_lidar[str(i)]
+            frame = self.lidar_frames.take(str(i))      # only a NEW frame; a stalled source publishes nothing
+            if frame is not None:
+                msg = frame.message
                 decoded = msg.get("decoded_data")
                 if not decoded:
                     now_ns = self.get_clock().now().nanoseconds
@@ -2116,7 +2122,8 @@ class RobotBaseNode(Node):
                 )
                 point_cloud = PointCloud2()
                 point_cloud.header = Header(frame_id="odom")
-                point_cloud.header.stamp = self.get_clock().now().to_msg()
+                # The frame's RECEIVE time, never 'now': a delayed publish keeps its true age (Codex #271).
+                point_cloud.header.stamp = rclpy.time.Time(nanoseconds=frame.received_ns).to_msg()
                 fields = [
                     PointField(name='x', offset=0,
                                datatype=PointField.FLOAT32, count=1),
