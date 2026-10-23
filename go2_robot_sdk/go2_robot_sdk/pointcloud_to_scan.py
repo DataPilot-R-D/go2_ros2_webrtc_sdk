@@ -18,6 +18,8 @@ from sensor_msgs_py import point_cloud2
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
+from go2_robot_sdk.scan_contract import publishable, ranges_from_points
+
 
 def _quat_rotate(q, v):
     # Rotate 3-vector v by unit quaternion q (x,y,z,w).
@@ -48,6 +50,8 @@ class PointCloudToScan(Node):
         self.declare_parameter('input_topic', '/point_cloud2')
         self.declare_parameter('output_topic', '/scan')
         self.declare_parameter('output_frame', 'radar')
+        # T5.9 scan contract: a cloud older than this (vs this node's clock) is never turned into a scan.
+        self.declare_parameter('max_cloud_age_s', 0.5)
 
         self.min_height = self.get_parameter('min_height').value
         self.max_height = self.get_parameter('max_height').value
@@ -59,6 +63,7 @@ class PointCloudToScan(Node):
         input_topic = self.get_parameter('input_topic').value
         output_topic = self.get_parameter('output_topic').value
         self.output_frame = self.get_parameter('output_frame').value
+        self.max_cloud_age_s = self.get_parameter('max_cloud_age_s').value
 
         self.num_ranges = int(
             (self.angle_max - self.angle_min) / self.angle_increment)
@@ -79,12 +84,12 @@ class PointCloudToScan(Node):
 
     def cloud_cb(self, msg):
         source_frame = msg.header.frame_id
-        # Look up transform from cloud frame into the sensor/base frame
-        # so we can express every point relative to the robot.
+        # Look up transform from cloud frame into the sensor/base frame AT THE CLOUD'S STAMP (Codex #264: the latest
+        # transform would place an old cloud with the robot's newer pose).
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.output_frame, source_frame,
-                rclpy.time.Time(),  # latest available
+                rclpy.time.Time.from_msg(msg.header.stamp),
                 timeout=rclpy.duration.Duration(seconds=0.05),
             )
         except (LookupException, ConnectivityException, ExtrapolationException) as exc:
@@ -112,31 +117,24 @@ class PointCloudToScan(Node):
         scan.time_increment = 0.0
         scan.scan_time = 0.1
 
-        ranges = [float('inf')] * self.num_ranges
+        def in_frame():
+            for point in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+                rx, ry, rz = _quat_rotate(q, (point[0], point[1], point[2]))   # target = q * src + t
+                yield rx + tx, ry + ty, rz + tz
 
-        for point in point_cloud2.read_points(
-                msg, field_names=("x", "y", "z"), skip_nans=True):
-            # Rotate then translate: target = q * src + t
-            rx, ry, rz = _quat_rotate(q, (point[0], point[1], point[2]))
-            x = rx + tx
-            y = ry + ty
-            z = rz + tz
-
-            if z < self.min_height or z > self.max_height:
-                continue
-
-            r = math.sqrt(x * x + y * y)
-            if r < self.range_min or r > self.range_max:
-                continue
-
-            angle = math.atan2(y, x)
-            if angle < self.angle_min or angle > self.angle_max:
-                continue
-
-            idx = int((angle - self.angle_min) / self.angle_increment)
-            if 0 <= idx < self.num_ranges:
-                if r < ranges[idx]:
-                    ranges[idx] = r
+        ranges = ranges_from_points(
+            in_frame(), min_height=self.min_height, max_height=self.max_height, range_min=self.range_min,
+            range_max=self.range_max, angle_min=self.angle_min, angle_max=self.angle_max,
+            angle_increment=self.angle_increment)
+        age = (self.get_clock().now() - rclpy.time.Time.from_msg(msg.header.stamp)).nanoseconds / 1e9
+        ok, why = publishable(ranges, age, self.max_cloud_age_s)
+        if not ok:
+            # No scan: the obstacle layer's expected_update_rate stops the controller (sensor-stall contract).
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self._tf_warn_last_ns > 2_000_000_000:
+                self.get_logger().warning(f"cloud not converted: {why}")
+                self._tf_warn_last_ns = now_ns
+            return
 
         scan.ranges = [float(r) for r in ranges]
         self.pub.publish(scan)
