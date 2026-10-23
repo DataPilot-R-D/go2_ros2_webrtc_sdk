@@ -39,6 +39,7 @@ from scripts_go2.go2_lidar_decoder import update_meshes_for_cloud2
 from scripts_go2.go2_math import get_robot_joints
 from scripts_go2.go2_camerainfo import load_camera_info
 from scripts_go2.webrtc_driver import Go2Connection
+from go2_robot_sdk.actuator_gate_input import GateInput, actuator_mode, joystick_payload
 
 import rclpy
 from rclpy.node import Node
@@ -170,13 +171,37 @@ class RobotBaseNode(Node):
 
         self.joy_state = Joy()
 
-        # Subscribe to cmd_vel_out (legacy — expected from twist_mux when
+        # T5.9 GO2_ACTUATOR_MODE=gate: the driver obeys ONLY the shared actuator gate
+        # (cmd_vel_mux, infra/actuator - the simulator's arbitration) and guards it with
+        # its own TTL; no raw velocity topic and no joystick can move the robot.
+        self.actuator_mode = actuator_mode(os.environ)
+        self._gate_input = None
+        if self.actuator_mode == 'gate':
+            if self.conn_mode != 'single':
+                raise RuntimeError('GO2_ACTUATOR_MODE=gate drives one robot per driver')
+            from actuator_mux import OutputGuard  # canonical infra/actuator (go2-native.sh puts it on sys.path)
+            from go2_robot_sdk.actuator_gate_input import GATE_OUTPUT_TTL_S
+            self._gate_input = GateInput(OutputGuard(GATE_OUTPUT_TTL_S))
+            self.create_subscription(
+                Twist,
+                'cmd_vel_mux',
+                lambda msg: self._gate_input.on_twist(msg.linear.x, msg.linear.y, msg.angular.z),
+                qos_profile)
+            # The gate's own status gates posture commands (they move the body too).
+            self.create_subscription(
+                String,
+                'cmd_vel_mux_status',
+                lambda msg: self._gate_input.on_status(msg.data),
+                qos_profile)
+        # Legacy (default): subscribe to cmd_vel_out (expected from twist_mux when
         # installed), cmd_vel_teleop (PAIC2 Robot Bridge) and cmd_vel
         # (Nav2 output). ros2_m1_native on M1 has no twist_mux package,
         # so we mux inside the driver: whichever topic has a fresh value
         # wins, teleop gets priority by being subscribed last.
         _cmd_topics = ('cmd_vel', 'cmd_vel_teleop', 'cmd_vel_out')
-        if self.conn_mode == 'single':
+        if self.actuator_mode == 'gate':
+            pass
+        elif self.conn_mode == 'single':
             for topic in _cmd_topics:
                 self.create_subscription(
                     Twist,
@@ -192,11 +217,12 @@ class RobotBaseNode(Node):
                         lambda msg, ri=str(i): self.cmd_vel_cb(msg, ri),
                         qos_profile)
 
-        self.create_subscription(
-            Joy,
-            'joy',
-            self.joy_cb,
-            qos_profile)
+        if self.actuator_mode == 'legacy':
+            self.create_subscription(
+                Joy,
+                'joy',
+                self.joy_cb,
+                qos_profile)
 
         # Dedicated mode-change ROS topics so the dashboard (or a curl
         # through rosbridge) can put the dog into BalanceStand / StandUp /
@@ -206,17 +232,17 @@ class RobotBaseNode(Node):
         self.create_subscription(
             Empty,
             'stand_up',
-            lambda _msg: self._send_sport_cmd("StandUp"),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("StandUp")),
             qos_profile)
         self.create_subscription(
             Empty,
             'balance_stand',
-            lambda _msg: self._send_sport_cmd("BalanceStand"),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("BalanceStand")),
             qos_profile)
         self.create_subscription(
             Empty,
             'stand_down',
-            lambda _msg: self._send_sport_cmd("StandDown"),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("StandDown")),
             qos_profile)
         # Full wake-up sequence — use this when the dog is in an idle
         # damp/safety state and plain StandUp / BalanceStand aren't
@@ -225,12 +251,12 @@ class RobotBaseNode(Node):
         self.create_subscription(
             Empty,
             'recovery_stand',
-            lambda _msg: self._send_sport_cmd("RecoveryStand"),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("RecoveryStand")),
             qos_profile)
         self.create_subscription(
             Empty,
             'wake_up',
-            lambda _msg: self._wake_up_sequence(),
+            lambda _msg: self._posture(self._wake_up_sequence),
             qos_profile)
 
         # Map file pull bridge — Robot Bridge can't open a 2nd WebRTC
@@ -343,20 +369,16 @@ class RobotBaseNode(Node):
         y = msg.linear.y
         z = msg.angular.z
 
-        # Use rt/wirelesscontroller (joystick emulation) for reliable locomotion
-        # Coordinate mapping: ROS twist -> Unitree joystick
-        #   ly = forward/back (twist.linear.x)
-        #   lx = strafe left/right (-twist.linear.y for Unitree convention)
-        #   rx = turn (-twist.angular.z for Unitree convention)
-        payload = json.dumps({
-            "type": "msg",
-            "topic": "rt/wirelesscontroller",
-            "data": {"lx": round(-y, 2), "ly": round(x, 2), "rx": round(-z, 2), "ry": 0}
-            if (x != 0.0 or y != 0.0 or z != 0.0)
-            else {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
-        })
-        self.robot_cmd_vel[robot_num] = payload
+        # rt/wirelesscontroller joystick emulation (shared with gate mode).
+        self.robot_cmd_vel[robot_num] = joystick_payload(x, y, z)
 
+
+    def _posture(self, send) -> None:
+        """Posture commands: legacy sends at once; gate mode only while the gate reports no engaged lock."""
+        if self._gate_input is not None and not self._gate_input.motion_allowed():
+            self.get_logger().warning("Posture command refused: the actuator gate is locked or silent")
+            return
+        send()
 
     def joy_cb(self, msg):
         self.joy_state = msg
@@ -471,6 +493,10 @@ class RobotBaseNode(Node):
 
         if self.conn_type == 'webrtc':
             self._drain_dc_outbox(robot_num)
+            if self._gate_input is not None and robot_num in self.conn:
+                payload = self._gate_input.payload_due()   # explicit zero when the gate is stale
+                if payload is not None:
+                    self.robot_cmd_vel[robot_num] = payload
             if robot_num in self.conn and robot_num in self.robot_cmd_vel and self.robot_cmd_vel[robot_num] is not None:
                 self._flush_cmd_vel(robot_num)
 
