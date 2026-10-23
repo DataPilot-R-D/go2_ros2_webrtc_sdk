@@ -19,6 +19,11 @@ sys.path.insert(0, str(CANONICAL))
 
 from actuator_mux import OutputGuard  # noqa: E402
 from go2_robot_sdk import actuator_gate_input as gate  # noqa: E402
+from go2_robot_sdk.actuator_units import JoystickCalibration  # noqa: E402
+
+# A unit-scale calibration measured in both directions: these tests exercise the gate TTL / refresh / posture rules;
+# the SI-to-axis conversion itself is test_actuator_units'.
+UNIT = JoystickCalibration({"ly": 1.0, "lx": 1.0, "rx": 1.0}, {"ly": 1.0, "lx": 1.0, "rx": 1.0}, "test", "test", "0" * 64)
 
 ZERO_STICKS = {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
 
@@ -38,7 +43,7 @@ def sticks(payload):
 
 
 def make(clock):
-    return gate.GateInput(OutputGuard(gate.GATE_OUTPUT_TTL_S, clock=clock), clock=clock)
+    return gate.GateInput(OutputGuard(gate.GATE_OUTPUT_TTL_S, clock=clock), UNIT, clock=clock)
 
 
 def test_a_never_started_gate_is_an_explicit_zero():

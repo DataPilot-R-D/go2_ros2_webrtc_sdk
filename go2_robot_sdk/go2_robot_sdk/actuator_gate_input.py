@@ -33,20 +33,31 @@ def actuator_mode(environ) -> str:
 
 
 def joystick_payload(x: float, y: float, z: float) -> str:
-    """ROS twist -> Unitree rt/wirelesscontroller (joystick emulation, the reliable locomotion path).
+    """LEGACY ROS twist -> Unitree rt/wirelesscontroller (joystick emulation): the values are copied, not converted.
 
-    ly = forward/back (linear.x), lx = strafe (-linear.y), rx = turn (-angular.z); all zero = explicit stop.
+    ly = forward/back (linear.x), lx = strafe (-linear.y), rx = turn (-angular.z); all zero = explicit stop. Gate
+    mode never uses this mapping: it converts through a measured calibration (actuator_units, Codex #228).
     """
     data = ({"lx": round(-y, 2), "ly": round(x, 2), "rx": round(-z, 2), "ry": 0}
             if (x != 0.0 or y != 0.0 or z != 0.0) else {"lx": 0, "ly": 0, "rx": 0, "ry": 0})
     return json.dumps({"type": "msg", "topic": "rt/wirelesscontroller", "data": data})
 
 
-class GateInput:
-    """The one velocity input of a gate-mode driver."""
+def _sticks_payload(data: dict) -> str:
+    return json.dumps({"type": "msg", "topic": "rt/wirelesscontroller", "data": data})
 
-    def __init__(self, guard, refresh_s: float = REFRESH_S, clock=time.monotonic):
+
+ZERO_STICKS = {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
+
+
+class GateInput:
+    """The one velocity input of a gate-mode driver: SI commands through the measured calibration (required)."""
+
+    def __init__(self, guard, calibration, refresh_s: float = REFRESH_S, clock=time.monotonic):
         self._guard = guard
+        self._calibration = calibration
+        self.refused = 0                 # commands refused by the units contract (sent as an explicit zero)
+        self.last_refused = None
         self._refresh_s = refresh_s
         self._clock = clock
         self._last_payload: str | None = None
@@ -75,7 +86,16 @@ class GateInput:
     def payload_due(self) -> str | None:
         """The stick state to send this tick (explicit zero when the gate is stale), or None if nothing is due."""
         x, y, _, z = self._guard.command()
-        payload = joystick_payload(x, y, z)
+        if x == 0.0 and y == 0.0 and z == 0.0:
+            data = ZERO_STICKS
+        else:
+            data = self._calibration.sticks(x, y, z)
+            if data is None:             # unmeasured direction or outside [-1, 1]: an explicit zero, reported
+                if self.last_refused != (x, y, z):
+                    self.refused += 1
+                self.last_refused = (x, y, z)
+                data = ZERO_STICKS
+        payload = _sticks_payload(data)
         now = self._clock()
         if payload == self._last_payload and now - self._last_sent < self._refresh_s:
             return None

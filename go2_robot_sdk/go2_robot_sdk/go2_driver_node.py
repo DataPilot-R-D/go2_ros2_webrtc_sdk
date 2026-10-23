@@ -181,7 +181,13 @@ class RobotBaseNode(Node):
                 raise RuntimeError('GO2_ACTUATOR_MODE=gate drives one robot per driver')
             from actuator_mux import OutputGuard  # canonical infra/actuator (go2-native.sh puts it on sys.path)
             from go2_robot_sdk.actuator_gate_input import GATE_OUTPUT_TTL_S
-            self._gate_input = GateInput(OutputGuard(GATE_OUTPUT_TTL_S))
+            from go2_robot_sdk.actuator_units import gate_calibration
+            # Codex #228 / #242: no measured SI-to-joystick calibration, no autonomous gate mode (refuses to start).
+            calibration = gate_calibration(os.environ)
+            self.get_logger().info(
+                f'gate mode: joystick calibration {calibration.sha256[:12]} (robot {calibration.robot_serial}, '
+                f'measured {calibration.measured_at})')
+            self._gate_input = GateInput(OutputGuard(GATE_OUTPUT_TTL_S), calibration)
             self.create_subscription(
                 Twist,
                 'cmd_vel_mux',
