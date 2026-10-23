@@ -23,11 +23,26 @@ def test_an_empty_cloud_gives_no_measured_return_and_is_not_published():
     assert sc.publishable(ranges, 0.05, 0.5) == (False, "no measured return in the cloud")
 
 
+def wall(x, y_from, y_to, step=0.02, z=0.2):
+    n = int(round((y_to - y_from) / step)) + 1
+    return [(x, y_from + i * step, z) for i in range(n)]
+
+
 def test_a_sparse_cloud_marks_only_its_bins_and_never_claims_free_space():
     ranges = sc.ranges_from_points([(2.0, 0.0, 0.2)], **PARAMS)
     finite = [r for r in ranges if math.isfinite(r)]
     assert finite == [2.0] and sum(math.isnan(r) for r in ranges) == 359 and not any(math.isinf(r) for r in ranges)
-    assert sc.publishable(ranges, 0.05, 0.5)[0]
+    # Codex #271: one steady point is not coverage of the travel sector - refused, fail-closed.
+    ok, why = sc.publishable(ranges, 0.05, 0.5)
+    assert not ok and "forward coverage" in why
+
+
+def test_a_covered_forward_sector_is_published_and_a_blind_one_is_not():
+    ahead = sc.ranges_from_points(wall(2.0, -2.0, 2.0), **PARAMS)            # a wall across the front, 45 deg each way
+    assert sc.forward_coverage(ahead, -math.pi, math.pi / 180.0) > 0.9 and sc.publishable(ahead, 0.05, 0.5)[0]
+    behind = sc.ranges_from_points([(-x, y, z) for x, y, z in wall(2.0, -2.0, 2.0)], **PARAMS)   # rear only
+    assert sc.forward_coverage(behind, -math.pi, math.pi / 180.0) == 0.0
+    assert not sc.publishable(behind, 0.05, 0.5)[0]
 
 
 def test_a_fully_height_filtered_cloud_is_not_free_space():
@@ -41,7 +56,7 @@ def test_the_nearest_return_wins_and_non_finite_points_are_ignored():
 
 
 def test_a_stale_or_future_cloud_is_never_converted():
-    ranges = sc.ranges_from_points([(2.0, 0.0, 0.2)], **PARAMS)
+    ranges = sc.ranges_from_points(wall(2.0, -2.0, 2.0), **PARAMS)
     assert not sc.publishable(ranges, 100.0, 0.5)[0]                         # Codex #264: a 100 s old transform/cloud
     assert not sc.publishable(ranges, -3.0, 0.5)[0]
     assert not sc.publishable(ranges, float("nan"), 0.5)[0]
@@ -54,5 +69,5 @@ def test_the_node_places_each_cloud_at_its_own_stamp_and_never_builds_an_all_inf
     body = ast.unparse(callback)
     assert "lookup_transform(self.output_frame, source_frame, rclpy.time.Time.from_msg(msg.header.stamp)" in body
     assert "float('inf')" not in body and "rclpy.time.Time()" not in body
-    assert "publishable(ranges" in body and "ranges_from_points(" in body
+    assert "publishable(ranges" in body and "ranges_from_points(" in body and "min_forward_coverage=" in body
     assert body.index("publishable(ranges") < body.index("self.pub.publish(scan)")

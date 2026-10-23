@@ -52,6 +52,9 @@ class PointCloudToScan(Node):
         self.declare_parameter('output_frame', 'radar')
         # T5.9 scan contract: a cloud older than this (vs this node's clock) is never turned into a scan.
         self.declare_parameter('max_cloud_age_s', 0.5)
+        # Coverage of the forward travel sector (Codex #271): UNCALIBRATED fail-closed defaults (scan_contract).
+        self.declare_parameter('min_forward_coverage', 0.5)
+        self.declare_parameter('forward_half_angle_deg', 45.0)
 
         self.min_height = self.get_parameter('min_height').value
         self.max_height = self.get_parameter('max_height').value
@@ -64,6 +67,8 @@ class PointCloudToScan(Node):
         output_topic = self.get_parameter('output_topic').value
         self.output_frame = self.get_parameter('output_frame').value
         self.max_cloud_age_s = self.get_parameter('max_cloud_age_s').value
+        self.min_forward_coverage = self.get_parameter('min_forward_coverage').value
+        self.forward_half_angle = math.radians(self.get_parameter('forward_half_angle_deg').value)
 
         self.num_ranges = int(
             (self.angle_max - self.angle_min) / self.angle_increment)
@@ -127,7 +132,9 @@ class PointCloudToScan(Node):
             range_max=self.range_max, angle_min=self.angle_min, angle_max=self.angle_max,
             angle_increment=self.angle_increment)
         age = (self.get_clock().now() - rclpy.time.Time.from_msg(msg.header.stamp)).nanoseconds / 1e9
-        ok, why = publishable(ranges, age, self.max_cloud_age_s)
+        ok, why = publishable(ranges, age, self.max_cloud_age_s, angle_min=self.angle_min,
+                              angle_increment=self.angle_increment, min_forward_coverage=self.min_forward_coverage,
+                              forward_half_angle=self.forward_half_angle)
         if not ok:
             # No scan: the obstacle layer's expected_update_rate stops the controller (sensor-stall contract).
             now_ns = self.get_clock().now().nanoseconds
