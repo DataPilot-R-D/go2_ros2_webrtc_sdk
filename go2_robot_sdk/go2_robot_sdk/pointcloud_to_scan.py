@@ -18,7 +18,8 @@ from sensor_msgs_py import point_cloud2
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
-from go2_robot_sdk.scan_contract import MAX_RAY_SEPARATION, publishable, ranges_from_points, to_frame
+from go2_robot_sdk.scan_contract import (MAX_RAY_SEPARATION, MIN_OBSTACLE_M, UNOBSERVED, hits_from_points,
+                                         publishable, to_frame)
 
 
 class PointCloudToScan(Node):
@@ -40,6 +41,7 @@ class PointCloudToScan(Node):
         # Coverage (Codex #271 / #275 / #276): the widest separation of neighbouring observed rays anywhere around the robot (rotation
         # sweeps every direction); the default is scan_contract's stated, UNCALIBRATED assumption.
         self.declare_parameter('max_ray_separation_deg', math.degrees(MAX_RAY_SEPARATION))
+        self.declare_parameter('min_obstacle_m', MIN_OBSTACLE_M)
 
         self.min_height = self.get_parameter('min_height').value
         self.max_height = self.get_parameter('max_height').value
@@ -53,6 +55,7 @@ class PointCloudToScan(Node):
         self.output_frame = self.get_parameter('output_frame').value
         self.max_cloud_age_s = self.get_parameter('max_cloud_age_s').value
         self.max_ray_separation = math.radians(self.get_parameter('max_ray_separation_deg').value)
+        self.min_obstacle = self.get_parameter('min_obstacle_m').value
 
         self.num_ranges = int(
             (self.angle_max - self.angle_min) / self.angle_increment)
@@ -107,13 +110,14 @@ class PointCloudToScan(Node):
         scan.scan_time = 0.1
 
         points = ((p[0], p[1], p[2]) for p in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
-        ranges = ranges_from_points(
+        hits = hits_from_points(
             to_frame(points, (tx, ty, tz), q), min_height=self.min_height, max_height=self.max_height, range_min=self.range_min,
             range_max=self.range_max, angle_min=self.angle_min, angle_max=self.angle_max,
             angle_increment=self.angle_increment)
+        ranges = [UNOBSERVED if hit is None else hit[0] for hit in hits]
         age = (self.get_clock().now() - rclpy.time.Time.from_msg(msg.header.stamp)).nanoseconds / 1e9
         ok, why = publishable(ranges, age, self.max_cloud_age_s, angle_increment=self.angle_increment,
-                              max_gap=self.max_ray_separation)
+                              max_gap=self.max_ray_separation, min_obstacle=self.min_obstacle, hits=hits)
         if not ok:
             # No scan: the obstacle layer's expected_update_rate stops the controller (sensor-stall contract).
             now_ns = self.get_clock().now().nanoseconds

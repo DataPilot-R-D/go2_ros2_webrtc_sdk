@@ -132,6 +132,64 @@ def test_the_node_places_each_cloud_at_its_own_stamp_and_never_builds_an_all_inf
     body = ast.unparse(callback)
     assert "lookup_transform(self.output_frame, source_frame, rclpy.time.Time.from_msg(msg.header.stamp)" in body
     assert "float('inf')" not in body and "rclpy.time.Time()" not in body
-    assert "publishable(ranges" in body and "ranges_from_points(" in body and "max_gap=" in body
+    assert "publishable(ranges" in body and "hits_from_points(" in body and "max_gap=" in body
+    assert "hits=hits" in body and "min_obstacle=" in body
     assert "to_frame(points" in body
     assert body.index("publishable(ranges") < body.index("self.pub.publish(scan)")
+
+
+def _ring_at(radius, gap_bins=(), n=360):
+    ranges = [radius] * n
+    for i in gap_bins:
+        ranges[i] = float("nan")
+    return ranges
+
+
+def test_a_gap_whose_hits_are_close_is_closed_by_the_chord():
+    """A wall 0.85 m away at 5 cm voxel spacing: returns ~3.4-5 deg apart, hits <= 0.10 m apart - no 10 cm obstacle
+    fits in the triangle they make with the sensor, so the scan is published (Codex #276 follow-up)."""
+    ranges = _ring_at(0.85, gap_bins=(179, 180, 181))                       # rays 4 deg apart
+    assert sc.max_observed_separation(ranges, math.pi / 180) == pytest.approx(math.radians(4.0))
+    assert sc.outer_chord(0.85, 0.85, 4, math.pi / 180) == pytest.approx(2 * 0.85 * math.sin(math.radians(2.5)))
+    assert sc.publishable(ranges, 0.05, 0.5)[0]
+
+
+def test_the_same_angular_gap_in_front_of_a_far_wall_is_refused():
+    ok, why = sc.publishable(_ring_at(3.0, gap_bins=(179, 180, 181)), 0.05, 0.5)
+    assert not ok and "4.0 deg apart" in why and "0.262 m apart" in why
+
+
+def test_a_wedge_between_a_near_post_and_a_far_wall_is_refused():
+    ranges = _ring_at(3.0, gap_bins=(180, 181, 182, 183))
+    ranges[179] = 0.4                                                       # a post right of the gap, wall to its left
+    ok, why = sc.publishable(ranges, 0.05, 0.5)
+    assert not ok and "apart" in why
+
+
+def test_the_chord_is_taken_between_the_bins_outer_edges():
+    # 0.08 m at the bin centres, but up to (steps + 1) increments apart at the edges -> refused
+    r = 0.08 / (2 * math.sin(math.radians(2.5)))                            # centre chord exactly 0.08 at 5 deg
+    ranges = _ring_at(r, gap_bins=(179, 180, 181, 182))                     # 5 increments
+    assert sc.outer_chord(r, r, 5, math.pi / 180) > 0.08
+    assert sc.outer_chord(r, r, 5, math.pi / 180) == pytest.approx(2 * r * math.sin(math.radians(3.0)))
+
+
+def test_coarse_sampling_is_refused_far_and_accepted_where_its_hits_touch():
+    far = sc.ranges_from_points(ring(radius=3.0), **dict(PARAMS, angle_increment=math.radians(5.0)))
+    assert not sc.publishable(far, 0.05, 0.5, angle_increment=math.radians(5.0))[0]
+    near = sc.ranges_from_points(ring(radius=0.4), **dict(PARAMS, angle_increment=math.radians(5.0)))
+    assert sc.publishable(near, 0.05, 0.5, angle_increment=math.radians(5.0))[0]     # outer chord 0.07 m
+
+
+def test_with_the_actual_hit_points_the_chord_is_exact():
+    """Bins 177 (-3..-2 deg) and 182 (2..3 deg) observed, 178-181 empty: 5 increments apart. The actual returns sit at
+    -2.05 / +2.05 deg on a wall 1 m away, 0.0715 m apart - closed by the exact chord; known only by bin, the outer
+    edges are 6 deg apart (0.105 m) and the same scan is refused."""
+    bearings = [d + 0.5 for d in range(-180, 180) if not -3 <= d <= 2] + [-2.05, 2.05]
+    points = [(math.cos(math.radians(b)), math.sin(math.radians(b)), 0.2) for b in bearings]
+    hits = sc.hits_from_points(points, **PARAMS)
+    assert [hits[i] is None for i in range(177, 183)] == [False, True, True, True, True, False]
+    ranges = [float("nan") if h is None else h[0] for h in hits]
+    assert sc.hit_chord(hits[177], hits[182]) == pytest.approx(2 * math.sin(math.radians(2.05)))
+    assert sc.open_gaps(ranges, math.pi / 180, hits=hits) == []
+    assert sc.publishable(ranges, 0.05, 0.5, hits=hits)[0] and not sc.publishable(ranges, 0.05, 0.5)[0]
