@@ -9,6 +9,10 @@ the caller sends an explicit zero instead and reports it - never a silent clip. 
 API 1008 Move) would replace this contract, not bypass it. Legacy mode (actuator_gate_input.joystick_payload) is
 unchanged and is never autonomous-calibrated.
 
+UNRESOLVED (Codex #244): the calibration's robot serial / firmware are only recorded and logged - they are not yet
+bound to the connected robot's identity, firmware or locomotion mode, and a JSON status 'measured' proves no physical
+port. Refusals are reported by the driver (GateInput.refusal_report, throttled warning).
+
 No ROS import: tested offline.
 """
 from __future__ import annotations

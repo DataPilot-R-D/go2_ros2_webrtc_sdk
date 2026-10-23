@@ -58,6 +58,7 @@ class GateInput:
         self._calibration = calibration
         self.refused = 0                 # commands refused by the units contract (sent as an explicit zero)
         self.last_refused = None
+        self._reported = 0
         self._refresh_s = refresh_s
         self._clock = clock
         self._last_payload: str | None = None
@@ -76,6 +77,15 @@ class GateInput:
         except (TypeError, ValueError, KeyError):
             free = False
         self._status = (self._clock(), free)
+
+    def refusal_report(self) -> str | None:
+        """A warning for every NEW refusal since the last report, None otherwise (Codex #244: a refused command is
+        an explicit zero, never silent). The driver logs it with a throttle, so it stays bounded."""
+        if self.refused == self._reported:
+            return None
+        self._reported = self.refused
+        return (f"actuator units refused {self.refused} command(s) so far, last {self.last_refused} "
+                "(an unmeasured direction or an axis beyond [-1, 1]); sent an explicit zero")
 
     def motion_allowed(self) -> bool:
         """Posture commands (stand up / down, wake up) move the body: only while the gate is ALIVE (fresh output,

@@ -507,6 +507,9 @@ class RobotBaseNode(Node):
                 payload = self._gate_input.payload_due()   # explicit zero when the gate is stale
                 if payload is not None:
                     self.robot_cmd_vel[robot_num] = payload
+                refusal = self._gate_input.refusal_report()   # a units refusal is reported, bounded
+                if refusal is not None:
+                    self.get_logger().warning(refusal, throttle_duration_sec=2.0)
             if robot_num in self.conn and robot_num in self.robot_cmd_vel and self.robot_cmd_vel[robot_num] is not None:
                 self._flush_cmd_vel(robot_num)
 

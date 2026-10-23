@@ -145,3 +145,22 @@ def test_the_driver_loads_the_calibration_before_building_the_gate_input():
 def test_legacy_mode_is_unchanged_and_distinct():
     assert sticks(gate.joystick_payload(0.3, 0.1, 0.5)) == {"lx": -0.1, "ly": 0.3, "rx": -0.5, "ry": 0}
     assert units.gate_calibration.__module__ == "go2_robot_sdk.actuator_units"
+
+
+
+def test_every_new_refusal_is_reported_once_and_the_driver_logs_it_bounded(tmp_path):
+    """Codex #244: a refused command is an explicit zero AND a warning; the driver throttles the log."""
+    clock = Clock()
+    cal = units.load_calibration(write(tmp_path, calibration()))
+    gi = gate.GateInput(OutputGuard(gate.GATE_OUTPUT_TTL_S, clock=clock), cal, clock=clock)
+    gi.on_twist(0.4, 0.0, 0.0)
+    gi.payload_due()
+    assert gi.refusal_report() is None                        # nothing refused
+    gi.on_twist(-0.1, 0.0, 0.0)
+    gi.payload_due()
+    report = gi.refusal_report()
+    assert report and "refused 1 command" in report and "(-0.1, 0.0, 0.0)" in report
+    assert gi.refusal_report() is None                        # reported once
+    source = (SDK_PKG / "go2_robot_sdk" / "go2_driver_node.py").read_text()
+    tick = source[source.index("payload = self._gate_input.payload_due()"):][:600]
+    assert "refusal_report()" in tick and "throttle_duration_sec=2.0" in tick
