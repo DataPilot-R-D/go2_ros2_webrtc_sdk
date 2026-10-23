@@ -2045,14 +2045,20 @@ class RobotBaseNode(Node):
         """ONE received pose -> ONE odom->base_link transform and ONE Odometry, both stamped with its receive time
         (Codex #274: one coherent sample; a cached pose re-stamped 'now' fabricated fresh TF). The Odometry's twist
         is the body-frame velocity DERIVED from this and the previous pose (odometry_velocity, Codex #279); without a
-        valid one (first pose, gap, non-finite) only the TF is published - never a twist claiming a standstill."""
+        valid one (first pose, gap, turn beyond the limit) only the TF is published - never a twist claiming a
+        standstill; a malformed pose (non-finite, non-unit quaternion) publishes NOTHING (Codex #282)."""
         for i in range(len(self.robot_odom)):
             frame = self.odom_frames.take(str(i))
             if frame is None:
                 continue                                   # no new pose: nothing is re-published
-            pose = frame.message['data']['pose']
+            pose = (frame.message.get('data') or {}).get('pose')
+            current, problem = pose_sample(frame.received_ns, pose)
+            if current is None:
+                # Codex #282: neither the transform nor the odometry of a malformed pose; the chain restarts.
+                self._odom_previous = {k: v for k, v in self._odom_previous.items() if k != str(i)}
+                self.get_logger().warning(f"pose refused: {problem}", throttle_duration_sec=5.0)
+                continue
             stamp = rclpy.time.Time(nanoseconds=frame.received_ns).to_msg()
-            current = pose_sample(frame.received_ns, pose)
             velocity = body_velocity(self._odom_previous.get(str(i)), current)
             self._odom_previous = {**self._odom_previous, str(i): current}
             child = "base_link" if self.conn_mode == 'single' else f"robot{str(i)}/base_link"
@@ -2082,7 +2088,7 @@ class RobotBaseNode(Node):
             odom_msg.pose.pose.orientation.y = pose['orientation']['y']
             odom_msg.pose.pose.orientation.z = pose['orientation']['z']
             odom_msg.pose.pose.orientation.w = pose['orientation']['w']
-            odom_msg.twist.twist.linear.x = velocity.vx       # child (body) frame; covariance all-zero = unknown
+            odom_msg.twist.twist.linear.x = velocity.vx       # child (body) frame; covariance not estimated
             odom_msg.twist.twist.linear.y = velocity.vy
             odom_msg.twist.twist.angular.z = velocity.wz
             self.go2_odometry_pub[i].publish(odom_msg)
