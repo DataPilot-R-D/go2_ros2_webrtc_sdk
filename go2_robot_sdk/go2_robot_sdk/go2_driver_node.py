@@ -39,7 +39,7 @@ from scripts_go2.go2_lidar_decoder import update_meshes_for_cloud2
 from scripts_go2.go2_math import get_robot_joints
 from scripts_go2.go2_camerainfo import load_camera_info
 from scripts_go2.webrtc_driver import Go2Connection
-from go2_robot_sdk.actuator_gate_input import GateInput, actuator_mode, joystick_payload
+from go2_robot_sdk.actuator_gate_input import POSTURE_LABEL, GateInput, actuator_mode, joystick_payload
 
 import rclpy
 from rclpy.node import Node
@@ -232,17 +232,17 @@ class RobotBaseNode(Node):
         self.create_subscription(
             Empty,
             'stand_up',
-            lambda _msg: self._posture(lambda: self._send_sport_cmd("StandUp")),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("StandUp", POSTURE_LABEL)),
             qos_profile)
         self.create_subscription(
             Empty,
             'balance_stand',
-            lambda _msg: self._posture(lambda: self._send_sport_cmd("BalanceStand")),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("BalanceStand", POSTURE_LABEL)),
             qos_profile)
         self.create_subscription(
             Empty,
             'stand_down',
-            lambda _msg: self._posture(lambda: self._send_sport_cmd("StandDown")),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("StandDown", POSTURE_LABEL)),
             qos_profile)
         # Full wake-up sequence — use this when the dog is in an idle
         # damp/safety state and plain StandUp / BalanceStand aren't
@@ -251,7 +251,7 @@ class RobotBaseNode(Node):
         self.create_subscription(
             Empty,
             'recovery_stand',
-            lambda _msg: self._posture(lambda: self._send_sport_cmd("RecoveryStand")),
+            lambda _msg: self._posture(lambda: self._send_sport_cmd("RecoveryStand", POSTURE_LABEL)),
             qos_profile)
         self.create_subscription(
             Empty,
@@ -429,10 +429,10 @@ class RobotBaseNode(Node):
         conn.data_channel.send(payload)
         return True
 
-    def _send_dc(self, robot_num, payload):
+    def _send_dc(self, robot_num, payload, label=None):
         """Queue a payload for the asyncio/WebRTC loop to drain."""
         with self._dc_send_lock:
-            self._dc_outbox.append((robot_num, payload, None))
+            self._dc_outbox.append((robot_num, payload, label))
 
     def _flush_cmd_vel(self, robot_num):
         try:
@@ -473,6 +473,10 @@ class RobotBaseNode(Node):
             self._dc_outbox = remaining_immediate
 
         for target_robot, payload, label in ready:
+            if label == POSTURE_LABEL and self._gate_input is not None and not self._gate_input.motion_allowed():
+                # Queued before the gate locked (or went silent): dropped, never sent late.
+                self.get_logger().warning(f"Posture command for robot {target_robot} dropped: actuator gate locked")
+                continue
             try:
                 if self._send_dc_now(target_robot, payload):
                     if label:
@@ -1727,19 +1731,22 @@ class RobotBaseNode(Node):
             _ack(False, error=f"unknown action '{action}'")
 
     def _wake_up_sequence(self) -> None:
+        threading.Thread(target=self._wake_up_steps, daemon=True).start()
+
+    def _wake_up_steps(self, sleep=time.sleep) -> None:
         # RecoveryStand → wait → BalanceStand. Needed after the dog has
         # been idle long enough to drop into damp / safety mode where
         # standalone StandUp is silently ignored by the sport controller.
-        import threading
-        def _run():
-            import time
-            for cmd, delay in (("RecoveryStand", 2.0), ("BalanceStand", 0.0)):
-                self._send_sport_cmd(cmd)
-                if delay:
-                    time.sleep(delay)
-        threading.Thread(target=_run, daemon=True).start()
+        # Gate mode re-checks the gate before EVERY step (a lock during the wait stops it).
+        for cmd, delay in (("RecoveryStand", 2.0), ("BalanceStand", 0.0)):
+            if self._gate_input is not None and not self._gate_input.motion_allowed():
+                self.get_logger().warning("Wake-up sequence stopped: the actuator gate is locked or silent")
+                return
+            self._send_sport_cmd(cmd, POSTURE_LABEL)
+            if delay:
+                sleep(delay)
 
-    def _send_sport_cmd(self, cmd_name: str) -> None:
+    def _send_sport_cmd(self, cmd_name: str, label=None) -> None:
         """Dispatch a ROBOT_CMD API call to every connected robot.
 
         Used by /stand_up, /balance_stand, /stand_down ROS topics so the
@@ -1751,7 +1758,7 @@ class RobotBaseNode(Node):
         payload = gen_command(ROBOT_CMD[cmd_name])
         for robot_num, conn in self.conn.items():
             try:
-                self._send_dc(robot_num, payload)
+                self._send_dc(robot_num, payload, label)
                 logger.info(f"Sent {cmd_name} to robot {robot_num}")
             except Exception as exc:
                 logger.warning(f"{cmd_name} dispatch to robot {robot_num} failed: {exc}")

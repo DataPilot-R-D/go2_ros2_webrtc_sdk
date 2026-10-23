@@ -20,6 +20,8 @@ GATE_OUTPUT_TTL_S = 0.5
 REFRESH_S = 0.5
 # The gate publishes cmd_vel_mux_status on every change and at least once a second; posture commands need it fresh.
 STATUS_TTL_S = 2.0
+# Outbox label of posture payloads: the driver re-checks the gate when it SENDS them, not only when they were queued.
+POSTURE_LABEL = "posture"
 
 
 def actuator_mode(environ) -> str:
