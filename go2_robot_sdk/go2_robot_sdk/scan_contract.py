@@ -18,13 +18,19 @@ no bound - a scan observed everywhere EXCEPT a central +-20 deg corridor would r
 unseen. The forward-only controller still rotates in place, so every direction can become the travel direction:
 EVERY gap between neighbouring observed rays around the robot (wrapping at +-pi) must be closed one of two ways -
 
-* ANGLE: the rays are at most ``MAX_RAY_SEPARATION`` apart (unobserved bins + 1 increments, Codex #276) - the angle
-  the smallest obstacle the robot must see (``MIN_OBSTACLE_M``) subtends at the distance it must see it
-  (``SEE_AT_M``), so no such obstacle fits between them within that distance; or
-* CHORD: the two measured hit points are at most ``MIN_OBSTACLE_M`` apart, taken conservatively between the bins'
-  OUTER edges. The triangle sensor-hit-hit then has no room for a disk that wide (its base is the widest part), and
+* ANGLE: the gap's opening is at most ``MAX_RAY_SEPARATION`` - the angle the smallest obstacle the robot must see
+  (``MIN_OBSTACLE_M``) subtends at the distance it must see it (``SEE_AT_M``), so no such obstacle fits in it within
+  that distance; or
+* CHORD: the gap is a MINOR sector (opening < pi) whose two measured hit points are at most ``MIN_OBSTACLE_M``
+  apart. The triangle sensor-hit-hit then has no room for a disk that wide (its base is the widest part), and
   whatever lies behind the segment between the hits is shielded by them (Nav2 marks and inflates both). This is what
-  a 5 cm voxel map gives near a wall - returns 3 to 5 deg apart at 0.85 m - and it is geometrically closed.
+  a 5 cm voxel map gives near a wall - returns 3 to 5 deg apart at 0.85 m - and it is geometrically closed. A reflex
+  gap (>= pi) is never closed by its endpoints' chord (Codex #289: two returns 1 deg apart leave 359 deg blind).
+
+The opening is the ORIENTED angle from one hit to the next, counter-clockwise around the circle. With the actual hit
+points (the adapter knows each bin's nearest return) it is exact; known only by bin, it is the conservative outer-edge
+bound ((unobserved bins + 2) increments) for the angle and the chord alike (Codex #289: hits 3.98 deg apart in bins 3
+apart must not pass a 3.82 deg bound).
 
 Anything else is refused: a sparse or holed cloud stops the robot rather than refreshing free space. Both numbers are
 STATED, PROVISIONAL assumptions until a measured sensor contract of the physical Go2 cloud replaces them; the voxel
@@ -106,11 +112,24 @@ def max_observed_separation(ranges, angle_increment: float) -> float:
     return max(steps for _, _, steps in found) * angle_increment
 
 
+def outer_opening(steps: int, angle_increment: float) -> float:
+    """The widest possible opening between two hits known only by bin: their bins' OUTER edges."""
+    return min(2.0 * math.pi, (steps + 1) * angle_increment)
+
+
+def chord(r1: float, r2: float, opening: float) -> float:
+    return math.sqrt(max(0.0, r1 * r1 + r2 * r2 - 2.0 * r1 * r2 * math.cos(opening)))
+
+
 def outer_chord(r1: float, r2: float, steps: int, angle_increment: float) -> float:
-    """The largest possible distance between two hits known only by bin: their bins' OUTER edges ((steps + 1)
-    increments apart)."""
-    spread = min(math.pi, (steps + 1) * angle_increment)
-    return math.sqrt(max(0.0, r1 * r1 + r2 * r2 - 2.0 * r1 * r2 * math.cos(spread)))
+    """The largest possible distance between two hits known only by bin (outer edges, capped at a straight angle)."""
+    return chord(r1, r2, min(math.pi, outer_opening(steps, angle_increment)))
+
+
+def hit_opening(a, b) -> float:
+    """The ORIENTED (counter-clockwise) angle from hit a to hit b, in [0, 2 pi); a full circle for the same hit."""
+    opening = (b[1] - a[1]) % (2.0 * math.pi)
+    return opening if opening > 0.0 else 2.0 * math.pi
 
 
 def hit_chord(a, b) -> float:
@@ -121,21 +140,22 @@ def hit_chord(a, b) -> float:
 def open_gaps(ranges, angle_increment: float, max_gap: float = MAX_RAY_SEPARATION,
               min_obstacle: float = MIN_OBSTACLE_M, hits=None) -> list[dict]:
     """Every gap closed neither by ANGLE nor by CHORD (module docstring). With ``hits`` (per bin (range, angle) of the
-    actual nearest point, as the adapter knows them) the chord is exact; without, it is the conservative outer-edge
-    bound."""
+    actual nearest point) the opening and the chord are exact; without, both are the conservative outer-edge
+    bounds."""
     found = gaps(ranges, angle_increment)
     if len(found) < 2:
-        return [{"separation_deg": 360.0, "chord_m": None, "bins": found[0][:2] if found else None}]
+        return [{"opening_deg": 360.0, "chord_m": None, "bins": found[0][:2] if found else None}]
     out = []
     for i, j, steps in found:
-        separation = steps * angle_increment
-        if separation <= max_gap + 1e-9:
+        exact = hits is not None and hits[i] is not None and hits[j] is not None
+        opening = hit_opening(hits[i], hits[j]) if exact else outer_opening(steps, angle_increment)
+        if opening <= max_gap + 1e-9:
             continue
-        chord = (hit_chord(hits[i], hits[j]) if hits is not None and hits[i] and hits[j]
-                 else outer_chord(ranges[i], ranges[j], steps, angle_increment))
-        if chord <= min_obstacle + 1e-9:
+        span = hit_chord(hits[i], hits[j]) if exact else outer_chord(ranges[i], ranges[j], steps, angle_increment)
+        if opening < math.pi and span <= min_obstacle + 1e-9:
             continue
-        out.append({"separation_deg": round(math.degrees(separation), 3), "chord_m": round(chord, 3), "bins": (i, j)})
+        out.append({"opening_deg": round(math.degrees(opening), 3),
+                    "chord_m": round(span, 3) if opening < math.pi else None, "bins": (i, j)})
     return out
 
 
@@ -150,9 +170,9 @@ def publishable(ranges, cloud_age_s: float, max_age_s: float, *, angle_increment
         return False, "no measured return in the cloud"
     holes = open_gaps(ranges, angle_increment, max_gap, min_obstacle, hits)
     if holes:
-        worst = max(holes, key=lambda h: h["separation_deg"])
-        chord = "open" if worst["chord_m"] is None else f"{worst['chord_m']:.3f} m"
-        return False, (f"observed rays {worst['separation_deg']:.1f} deg apart > {math.degrees(max_gap):.2f} deg with "
-                       f"hits {chord} apart > {min_obstacle:.2f} m (an obstacle could hide between them; "
+        worst = max(holes, key=lambda h: h["opening_deg"])
+        span = "a reflex sector" if worst["chord_m"] is None else f"hits {worst['chord_m']:.3f} m apart"
+        return False, (f"observed rays {worst['opening_deg']:.1f} deg apart > {math.degrees(max_gap):.2f} deg with "
+                       f"{span} (> {min_obstacle:.2f} m; an obstacle could hide between them; "
                        f"{len(holes)} such gap(s))")
     return True, ""

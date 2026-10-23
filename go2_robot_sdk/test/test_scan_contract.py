@@ -47,9 +47,11 @@ def test_a_fully_observed_ring_is_published_and_two_missing_bins_are_tolerated()
     full = sc.ranges_from_points(ring(), **PARAMS)
     assert math.degrees(sc.max_observed_separation(full, math.pi / 180)) == pytest.approx(1.0)
     assert sc.publishable(full, 0.05, 0.5)[0]
-    ranges = sc.ranges_from_points(ring(skip=lambda b: 10 < b < 12), **PARAMS)     # 2 bins -> rays 3 deg apart
+    hits = sc.hits_from_points(ring(skip=lambda b: 10 < b < 12), **PARAMS)          # 2 bins -> returns 3 deg apart
+    ranges = [float("nan") if h is None else h[0] for h in hits]
     assert math.degrees(sc.max_observed_separation(ranges, math.pi / 180)) == pytest.approx(3.0)
-    assert sc.publishable(ranges, 0.05, 0.5)[0]
+    assert sc.publishable(ranges, 0.05, 0.5, hits=hits)[0]                         # exact opening 3 deg
+    assert not sc.publishable(ranges, 0.05, 0.5)[0]           # known only by bin: outer edges 4 deg (Codex #289)
 
 
 def test_codex_276_three_unobserved_bins_open_four_degrees_and_hide_the_obstacle():
@@ -59,7 +61,7 @@ def test_codex_276_three_unobserved_bins_open_four_degrees_and_hide_the_obstacle
     ranges[179] = ranges[180] = ranges[181] = float("nan")                 # -1 / 0 / +1 deg unobserved
     assert math.degrees(sc.max_observed_separation(ranges, math.pi / 180)) == pytest.approx(4.0)
     ok, why = sc.publishable(ranges, 0.05, 0.5)
-    assert not ok and "4.0 deg apart" in why
+    assert not ok and "5.0 deg apart" in why                  # known only by bin: the outer edges
 
 
 def test_a_fully_observed_scan_sampled_coarser_than_the_bound_is_refused():
@@ -151,12 +153,12 @@ def test_a_gap_whose_hits_are_close_is_closed_by_the_chord():
     ranges = _ring_at(0.85, gap_bins=(179, 180, 181))                       # rays 4 deg apart
     assert sc.max_observed_separation(ranges, math.pi / 180) == pytest.approx(math.radians(4.0))
     assert sc.outer_chord(0.85, 0.85, 4, math.pi / 180) == pytest.approx(2 * 0.85 * math.sin(math.radians(2.5)))
-    assert sc.publishable(ranges, 0.05, 0.5)[0]
+    assert sc.publishable(ranges, 0.05, 0.5)[0]                # bin-only: outer chord 0.074 m, a minor sector
 
 
 def test_the_same_angular_gap_in_front_of_a_far_wall_is_refused():
     ok, why = sc.publishable(_ring_at(3.0, gap_bins=(179, 180, 181)), 0.05, 0.5)
-    assert not ok and "4.0 deg apart" in why and "0.262 m apart" in why
+    assert not ok and "5.0 deg apart" in why and "0.262 m apart" in why
 
 
 def test_a_wedge_between_a_near_post_and_a_far_wall_is_refused():
@@ -193,3 +195,42 @@ def test_with_the_actual_hit_points_the_chord_is_exact():
     assert sc.hit_chord(hits[177], hits[182]) == pytest.approx(2 * math.sin(math.radians(2.05)))
     assert sc.open_gaps(ranges, math.pi / 180, hits=hits) == []
     assert sc.publishable(ranges, 0.05, 0.5, hits=hits)[0] and not sc.publishable(ranges, 0.05, 0.5)[0]
+
+
+
+def _hits(*returns, n=360):
+    """Per-bin hits from explicit (range, bearing_deg) returns, as hits_from_points makes them."""
+    points = [(r * math.cos(math.radians(b)), r * math.sin(math.radians(b)), 0.2) for r, b in returns]
+    hits = sc.hits_from_points(points, **PARAMS)
+    return [float("nan") if h is None else h[0] for h in hits], hits
+
+
+@pytest.mark.parametrize("returns", [
+    [(0.5, 0.2), (0.5, 1.2)],                  # Codex #289: two returns 1 deg apart, 359 deg blind
+    [(0.5, 179.6), (0.5, -179.6)],             # the same across the +-180 seam
+    [(0.2, 10.0), (0.2, 40.0)],                # a short chord (0.10 m) whose OTHER gap is a 330 deg reflex
+])
+def test_a_reflex_gap_is_never_closed_by_its_endpoints_chord(returns):
+    ranges, hits = _hits(*returns)
+    ok, why = sc.publishable(ranges, 0.05, 0.5, hits=hits)
+    assert not ok and "reflex" in why
+    assert not sc.publishable(ranges, 0.05, 0.5)[0]
+
+
+def test_codex_289_exact_hit_angles_beat_the_bin_count():
+    """Every other direction sampled at 1 deg; the gap's returns at 0.01 and 3.99 deg on a 5 m wall: bins only 3 apart,
+    but the measured opening is 3.98 deg > 3.82 - refused with hits, and refused without (outer edges 5 deg)."""
+    returns = [(5.0, d + 0.5) for d in range(-180, 180) if not 0 <= d <= 3] + [(5.0, 0.01), (5.0, 3.99)]
+    ranges, hits = _hits(*returns)
+    assert hits[180] is not None and hits[183] is not None and all(hits[i] is None for i in (181, 182))
+    assert math.degrees(sc.hit_opening(hits[180], hits[183])) == pytest.approx(3.98)
+    ok, why = sc.publishable(ranges, 0.05, 0.5, hits=hits)
+    assert not ok and "4.0 deg apart" in why
+    assert not sc.publishable(ranges, 0.05, 0.5)[0]
+
+
+def test_the_opening_is_oriented_counter_clockwise():
+    a, b = (1.0, math.radians(179.0)), (1.0, math.radians(-179.0))
+    assert math.degrees(sc.hit_opening(a, b)) == pytest.approx(2.0)                # across the seam
+    assert math.degrees(sc.hit_opening(b, a)) == pytest.approx(358.0)
+    assert sc.hit_opening(a, a) == pytest.approx(2 * math.pi)
