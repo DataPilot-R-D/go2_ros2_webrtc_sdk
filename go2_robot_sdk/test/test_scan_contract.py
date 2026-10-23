@@ -40,14 +40,42 @@ def test_a_sparse_cloud_marks_only_its_bins_and_never_claims_free_space():
     finite = [r for r in ranges if math.isfinite(r)]
     assert finite == [2.0] and sum(math.isnan(r) for r in ranges) == 359 and not any(math.isinf(r) for r in ranges)
     ok, why = sc.publishable(ranges, 0.05, 0.5)                          # one steady point is no coverage
-    assert not ok and "unobserved gap" in why
+    assert not ok and "apart" in why
 
 
-def test_a_fully_observed_ring_is_published_and_one_missing_bin_is_tolerated():
-    assert sc.publishable(sc.ranges_from_points(ring(), **PARAMS), 0.05, 0.5)[0]
-    ranges = sc.ranges_from_points(ring(skip=lambda b: 10 < b < 12), **PARAMS)     # 2 bins = 2 deg < the bound
-    assert math.degrees(sc.max_unobserved_gap(ranges, math.pi / 180)) == pytest.approx(2.0)
+def test_a_fully_observed_ring_is_published_and_two_missing_bins_are_tolerated():
+    full = sc.ranges_from_points(ring(), **PARAMS)
+    assert math.degrees(sc.max_observed_separation(full, math.pi / 180)) == pytest.approx(1.0)
+    assert sc.publishable(full, 0.05, 0.5)[0]
+    ranges = sc.ranges_from_points(ring(skip=lambda b: 10 < b < 12), **PARAMS)     # 2 bins -> rays 3 deg apart
+    assert math.degrees(sc.max_observed_separation(ranges, math.pi / 180)) == pytest.approx(3.0)
     assert sc.publishable(ranges, 0.05, 0.5)[0]
+
+
+def test_codex_276_three_unobserved_bins_open_four_degrees_and_hide_the_obstacle():
+    """Observed rays at -2 and +2 deg, NaN at -1 / 0 / +1: the opening is 4 deg > the 3.82 deg a 10 cm obstacle at
+    1.5 m subtends - refused (an unobserved-bin count of 3 deg would have passed it)."""
+    ranges = [3.0] * 360                       # bin i covers bearing -180 + i .. -179 + i deg
+    ranges[179] = ranges[180] = ranges[181] = float("nan")                 # -1 / 0 / +1 deg unobserved
+    assert math.degrees(sc.max_observed_separation(ranges, math.pi / 180)) == pytest.approx(4.0)
+    ok, why = sc.publishable(ranges, 0.05, 0.5)
+    assert not ok and "4.0 deg apart" in why
+
+
+def test_a_fully_observed_scan_sampled_coarser_than_the_bound_is_refused():
+    coarse = dict(PARAMS, angle_increment=math.radians(5.0))
+    ranges = sc.ranges_from_points(ring(), **coarse)
+    assert all(math.isfinite(r) for r in ranges) and len(ranges) == 72
+    assert not sc.publishable(ranges, 0.05, 0.5, angle_increment=math.radians(5.0))[0]
+
+
+def test_the_separation_wraps_across_the_seam():
+    ranges = [float("nan")] * 360
+    ranges[2], ranges[357] = 1.0, 1.0                                     # 5 bins apart across +-180
+    assert math.degrees(sc.max_observed_separation(ranges, math.pi / 180)) == pytest.approx(355.0)
+    ranges = [1.0] * 360
+    ranges[0] = ranges[359] = float("nan")                                # the seam bins unobserved
+    assert math.degrees(sc.max_observed_separation(ranges, math.pi / 180)) == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize("hole", [
@@ -59,12 +87,12 @@ def test_a_fully_observed_ring_is_published_and_one_missing_bin_is_tolerated():
 def test_an_unobserved_sector_anywhere_around_the_robot_refuses_the_scan(hole):
     ranges = sc.ranges_from_points(ring(skip=hole), **PARAMS)
     ok, why = sc.publishable(ranges, 0.05, 0.5)
-    assert not ok and "unobserved gap" in why
+    assert not ok and "apart" in why
 
 
 def test_the_gap_bound_is_the_stated_geometric_assumption():
-    assert sc.MAX_UNOBSERVED_GAP == pytest.approx(2 * math.atan(0.05 / 1.5))
-    assert math.degrees(sc.MAX_UNOBSERVED_GAP) < 4.0
+    assert sc.MAX_RAY_SEPARATION == pytest.approx(2 * math.atan(0.05 / 1.5))
+    assert math.degrees(sc.MAX_RAY_SEPARATION) < 4.0
 
 
 def test_after_the_transform_bin_zero_is_the_body_heading():

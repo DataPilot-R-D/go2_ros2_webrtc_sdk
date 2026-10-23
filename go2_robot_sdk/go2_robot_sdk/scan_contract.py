@@ -16,8 +16,9 @@ contract) - an empty or stale observation never refreshes the costmap as free sp
 Coverage (Codex #271 / #275): 360 output bins are not 360 observed directions, and an aggregate percentage is no
 bound - a scan observed everywhere EXCEPT a central +-20 deg corridor would refresh Nav2 with the travel path unseen.
 The forward-only controller still rotates in place, so every direction can become the travel direction: a scan is
-published only if NO contiguous run of unobserved bins anywhere around the robot (wrapping at +-pi) is wider than
-``max_unobserved_gap``. The default bounds the angle the smallest obstacle the robot must see (``MIN_OBSTACLE_M``)
+published only if the angular SEPARATION of every pair of neighbouring observed rays around the robot (wrapping at
++-pi) is at most ``MAX_RAY_SEPARATION`` - the opening an obstacle could hide in is the unobserved bins PLUS one
+increment (Codex #276), and a fully observed scan sampled coarser than the bound is refused too. The default bounds the angle the smallest obstacle the robot must see (``MIN_OBSTACLE_M``)
 subtends at the distance it must see it (``SEE_AT_M``): both are STATED ASSUMPTIONS, UNCALIBRATED until a measured
 sensor contract of the physical Go2 cloud replaces them - the bound is strict enough that a holed cloud stops the
 robot rather than refreshing free space.
@@ -54,7 +55,7 @@ def ranges_from_points(points_xyz, *, min_height, max_height, range_min, range_m
 
 MIN_OBSTACLE_M = 0.10      # ASSUMPTION: the narrowest obstacle the robot must perceive (a chair leg)
 SEE_AT_M = 1.5             # ASSUMPTION: the distance it must be perceived at (controller horizon at 0.4 m/s)
-MAX_UNOBSERVED_GAP = 2.0 * math.atan((MIN_OBSTACLE_M / 2.0) / SEE_AT_M)     # ~3.8 deg
+MAX_RAY_SEPARATION = 2.0 * math.atan((MIN_OBSTACLE_M / 2.0) / SEE_AT_M)     # ~3.8 deg
 
 
 def _quat_rotate(q, v):
@@ -78,31 +79,28 @@ def to_frame(points, translation, rotation):
         yield rx + tx, ry + ty, rz + tz
 
 
-def max_unobserved_gap(ranges, angle_increment: float) -> float:
-    """Widest contiguous run of unobserved (non-finite) bins, in radians, wrapping around the circle."""
-    if not ranges:
+def max_observed_separation(ranges, angle_increment: float) -> float:
+    """Widest angular separation between neighbouring OBSERVED rays, in radians, around the circle: an opening of k
+    unobserved bins between two observed rays is (k + 1) increments wide; an all-observed scan is one increment; a
+    single observed ray (or none) leaves the whole circle open."""
+    observed = [i for i, r in enumerate(ranges) if math.isfinite(r)]
+    if len(observed) < 2:
         return 2.0 * math.pi
-    observed = [math.isfinite(r) for r in ranges]
-    if not any(observed):
-        return len(ranges) * angle_increment
-    start = observed.index(True)                     # rotate so the sequence starts at an observed bin
-    rolled = observed[start:] + observed[:start]
-    widest = run = 0
-    for seen in rolled:
-        run = 0 if seen else run + 1
-        widest = max(widest, run)
-    return widest * angle_increment
+    steps = [b - a for a, b in zip(observed, observed[1:])] + [observed[0] + len(ranges) - observed[-1]]
+    return max(steps) * angle_increment
 
 
 def publishable(ranges, cloud_age_s: float, max_age_s: float, *, angle_increment: float = math.pi / 180.0,
-                max_gap: float = MAX_UNOBSERVED_GAP) -> tuple[bool, str]:
-    """Whether to publish this scan at all: never a stale cloud, never one without a measured return, never one with
-    an unobserved gap wider than ``max_gap`` anywhere around the robot (rotation sweeps every direction)."""
+                max_gap: float = MAX_RAY_SEPARATION) -> tuple[bool, str]:
+    """Whether to publish this scan at all: never a stale cloud, never one without a measured return, never one whose
+    neighbouring observed rays are more than ``max_gap`` apart anywhere around the robot (rotation sweeps every
+    direction)."""
     if not math.isfinite(cloud_age_s) or cloud_age_s > max_age_s or cloud_age_s < -max_age_s:
         return False, f"cloud age {cloud_age_s:.3f} s outside +-{max_age_s} s"
     if not any(math.isfinite(r) for r in ranges):
         return False, "no measured return in the cloud"
-    gap = max_unobserved_gap(ranges, angle_increment)
-    if gap > max_gap + 1e-9:
-        return False, f"unobserved gap {math.degrees(gap):.1f} deg > {math.degrees(max_gap):.1f} deg"
+    separation = max_observed_separation(ranges, angle_increment)
+    if separation > max_gap + 1e-9:
+        return False, (f"observed rays {math.degrees(separation):.1f} deg apart > {math.degrees(max_gap):.2f} deg "
+                       "(an obstacle could hide between them)")
     return True, ""
