@@ -40,7 +40,7 @@ from scripts_go2.go2_math import get_robot_joints
 from scripts_go2.go2_camerainfo import load_camera_info
 from scripts_go2.webrtc_driver import Go2Connection
 from go2_robot_sdk.actuator_gate_input import POSTURE_LABEL, GateInput, actuator_mode, joystick_payload
-from go2_robot_sdk.lidar_frames import LidarFrames
+from go2_robot_sdk.received_frames import ReceivedFrames
 
 import rclpy
 import rclpy.time
@@ -170,8 +170,10 @@ class RobotBaseNode(Node):
         self.robot_low_cmd = {}
         self.robot_sport_state = {}
         self.robot_lidar = {}
-        # T5.9 (Codex #271): each received lidar frame is published once, stamped with its receive time.
-        self.lidar_frames = LidarFrames()
+        # T5.9 (Codex #271 / #274): each received lidar frame and odometry pose is published once, stamped with its
+        # receive time - a stalled source publishes nothing (never a cached copy stamped now).
+        self.lidar_frames = ReceivedFrames()
+        self.odom_frames = ReceivedFrames()
 
         self.joy_state = Joy()
 
@@ -328,8 +330,7 @@ class RobotBaseNode(Node):
     def timer_callback(self):
         if self.conn_type == 'webrtc':
             try:
-                self.publish_odom_webrtc()
-                self.publish_odom_topic_webrtc()
+                self.publish_odometry_webrtc()
                 self.publish_robot_state_webrtc()
                 self.publish_joint_state_webrtc()
             except Exception as e:
@@ -1868,6 +1869,7 @@ class RobotBaseNode(Node):
 
         if msg.get('topic') == RTC_TOPIC['ROBOTODOM']:
             self.robot_odom[robot_num] = msg
+            self.odom_frames.accept(robot_num, msg, self.get_clock().now().nanoseconds)
 
         if msg.get('topic') == RTC_TOPIC['LF_SPORT_MOD_STATE']:
             self.robot_sport_state[robot_num] = msg
@@ -2036,62 +2038,40 @@ class RobotBaseNode(Node):
                 )
                 self._grid_map_decode_warned = True
 
-    def publish_odom_webrtc(self):
+    def publish_odometry_webrtc(self):
+        """ONE received pose -> ONE odom->base_link transform and ONE Odometry, both stamped with its receive time
+        (Codex #274: one coherent sample; a cached pose re-stamped 'now' fabricated fresh TF)."""
         for i in range(len(self.robot_odom)):
-            if self.robot_odom[str(i)]:
-                odom_trans = TransformStamped()
-                odom_trans.header.stamp = self.get_clock().now().to_msg()
-                odom_trans.header.frame_id = 'odom'
-
-                if self.conn_mode == 'single':
-                    odom_trans.child_frame_id = "base_link"
-                else:
-                    odom_trans.child_frame_id = f"robot{str(i)}/base_link"
-
-                odom_trans.transform.translation.x = self.robot_odom[str(
-                    i)]['data']['pose']['position']['x']
-                odom_trans.transform.translation.y = self.robot_odom[str(
-                    i)]['data']['pose']['position']['y']
-                odom_trans.transform.translation.z = self.robot_odom[str(
-                    i)]['data']['pose']['position']['z'] + 0.07
-                odom_trans.transform.rotation.x = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['x']
-                odom_trans.transform.rotation.y = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['y']
-                odom_trans.transform.rotation.z = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['z']
-                odom_trans.transform.rotation.w = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['w']
-                self.broadcaster.sendTransform(odom_trans)
-
-    def publish_odom_topic_webrtc(self):
-        for i in range(len(self.robot_odom)):
-            if self.robot_odom[str(i)]:
-                odom_msg = Odometry()
-                odom_msg.header.stamp = self.get_clock().now().to_msg()
-                odom_msg.header.frame_id = 'odom'
-
-                if self.conn_mode == 'single':
-                    odom_msg.child_frame_id = "base_link"
-
-                else:
-                    odom_msg.child_frame_id = f"robot{str(i)}/base_link"
-
-                odom_msg.pose.pose.position.x = self.robot_odom[str(
-                    i)]['data']['pose']['position']['x']
-                odom_msg.pose.pose.position.y = self.robot_odom[str(
-                    i)]['data']['pose']['position']['y']
-                odom_msg.pose.pose.position.z = self.robot_odom[str(
-                    i)]['data']['pose']['position']['z'] + 0.07
-                odom_msg.pose.pose.orientation.x = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['x']
-                odom_msg.pose.pose.orientation.y = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['y']
-                odom_msg.pose.pose.orientation.z = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['z']
-                odom_msg.pose.pose.orientation.w = self.robot_odom[str(
-                    i)]['data']['pose']['orientation']['w']
-                self.go2_odometry_pub[i].publish(odom_msg)
+            frame = self.odom_frames.take(str(i))
+            if frame is None:
+                continue                                   # no new pose: nothing is re-published
+            pose = frame.message['data']['pose']
+            stamp = rclpy.time.Time(nanoseconds=frame.received_ns).to_msg()
+            child = "base_link" if self.conn_mode == 'single' else f"robot{str(i)}/base_link"
+            odom_trans = TransformStamped()
+            odom_trans.header.stamp = stamp
+            odom_trans.header.frame_id = 'odom'
+            odom_trans.child_frame_id = child
+            odom_trans.transform.translation.x = pose['position']['x']
+            odom_trans.transform.translation.y = pose['position']['y']
+            odom_trans.transform.translation.z = pose['position']['z'] + 0.07
+            odom_trans.transform.rotation.x = pose['orientation']['x']
+            odom_trans.transform.rotation.y = pose['orientation']['y']
+            odom_trans.transform.rotation.z = pose['orientation']['z']
+            odom_trans.transform.rotation.w = pose['orientation']['w']
+            self.broadcaster.sendTransform(odom_trans)
+            odom_msg = Odometry()
+            odom_msg.header.stamp = stamp
+            odom_msg.header.frame_id = 'odom'
+            odom_msg.child_frame_id = child
+            odom_msg.pose.pose.position.x = pose['position']['x']
+            odom_msg.pose.pose.position.y = pose['position']['y']
+            odom_msg.pose.pose.position.z = pose['position']['z'] + 0.07
+            odom_msg.pose.pose.orientation.x = pose['orientation']['x']
+            odom_msg.pose.pose.orientation.y = pose['orientation']['y']
+            odom_msg.pose.pose.orientation.z = pose['orientation']['z']
+            odom_msg.pose.pose.orientation.w = pose['orientation']['w']
+            self.go2_odometry_pub[i].publish(odom_msg)
 
     def publish_lidar_webrtc(self):
         # Rate-limit the "missing decoded_data" warning so a stream of
