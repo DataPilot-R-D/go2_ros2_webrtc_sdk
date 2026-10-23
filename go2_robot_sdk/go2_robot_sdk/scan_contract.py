@@ -13,11 +13,14 @@ A cloud that yields no measured return, or that is older than ``max_age_s``, pro
 layer's expected_update_rate then makes the source not current and the controller stops (the sensor-stall
 contract) - an empty or stale observation never refreshes the costmap as free space.
 
-Coverage (Codex #271): 360 output bins are not 360 observed directions - one steady rear point would keep the
-obstacle source "current" while the travel corridor is blind. A scan is published only if at least
-``min_forward_coverage`` of the bins within ``forward_half_angle`` of the robot's heading hold a measured return (the
-stack is forward-only; enabling reverse must add the rear sector). The defaults are FAIL-CLOSED and UNCALIBRATED: the
-physical Go2 cloud's coverage has not been measured; set them from that measurement, never from a guess that passes.
+Coverage (Codex #271 / #275): 360 output bins are not 360 observed directions, and an aggregate percentage is no
+bound - a scan observed everywhere EXCEPT a central +-20 deg corridor would refresh Nav2 with the travel path unseen.
+The forward-only controller still rotates in place, so every direction can become the travel direction: a scan is
+published only if NO contiguous run of unobserved bins anywhere around the robot (wrapping at +-pi) is wider than
+``max_unobserved_gap``. The default bounds the angle the smallest obstacle the robot must see (``MIN_OBSTACLE_M``)
+subtends at the distance it must see it (``SEE_AT_M``): both are STATED ASSUMPTIONS, UNCALIBRATED until a measured
+sensor contract of the physical Go2 cloud replaces them - the bound is strict enough that a holed cloud stops the
+robot rather than refreshing free space.
 """
 from __future__ import annotations
 
@@ -49,27 +52,57 @@ def ranges_from_points(points_xyz, *, min_height, max_height, range_min, range_m
     return out
 
 
-MIN_FORWARD_COVERAGE = 0.5            # UNCALIBRATED fail-closed default (see the module docstring)
-FORWARD_HALF_ANGLE = math.radians(45.0)
+MIN_OBSTACLE_M = 0.10      # ASSUMPTION: the narrowest obstacle the robot must perceive (a chair leg)
+SEE_AT_M = 1.5             # ASSUMPTION: the distance it must be perceived at (controller horizon at 0.4 m/s)
+MAX_UNOBSERVED_GAP = 2.0 * math.atan((MIN_OBSTACLE_M / 2.0) / SEE_AT_M)     # ~3.8 deg
 
 
-def forward_coverage(ranges, angle_min: float, angle_increment: float,
-                     half_angle: float = FORWARD_HALF_ANGLE) -> float:
-    """Fraction of the bins within ``half_angle`` of the heading (angle 0) that hold a measured return."""
-    sector = [r for i, r in enumerate(ranges) if abs(angle_min + (i + 0.5) * angle_increment) <= half_angle]
-    return sum(1 for r in sector if math.isfinite(r)) / len(sector) if sector else 0.0
+def _quat_rotate(q, v):
+    """Rotate v by the unit quaternion q (x, y, z, w)."""
+    qx, qy, qz, qw = q
+    x, y, z = v
+    t2, t3, t4 = qw * qx, qw * qy, qw * qz
+    t5, t6, t7 = -qx * qx, qx * qy, qx * qz
+    t8, t9, t10 = -qy * qy, qy * qz, -qz * qz
+    return (2 * ((t8 + t10) * x + (t6 - t4) * y + (t3 + t7) * z) + x,
+            2 * ((t4 + t6) * x + (t5 + t10) * y + (t9 - t2) * z) + y,
+            2 * ((t7 - t3) * x + (t2 + t9) * y + (t5 + t8) * z) + z)
 
 
-def publishable(ranges, cloud_age_s: float, max_age_s: float, *, angle_min: float = -math.pi,
-                angle_increment: float = math.pi / 180.0, min_forward_coverage: float = MIN_FORWARD_COVERAGE,
-                forward_half_angle: float = FORWARD_HALF_ANGLE) -> tuple[bool, str]:
-    """Whether to publish this scan at all: never a stale cloud, never one without a measured return, never one that
-    leaves the forward travel sector unobserved."""
+def to_frame(points, translation, rotation):
+    """tf2 semantics of lookup_transform(target, source): p_target = R(rotation) * p_source + translation, so after
+    the transform into the robot's base frame, angle 0 of the scan is the body heading."""
+    tx, ty, tz = translation
+    for point in points:
+        rx, ry, rz = _quat_rotate(rotation, point)
+        yield rx + tx, ry + ty, rz + tz
+
+
+def max_unobserved_gap(ranges, angle_increment: float) -> float:
+    """Widest contiguous run of unobserved (non-finite) bins, in radians, wrapping around the circle."""
+    if not ranges:
+        return 2.0 * math.pi
+    observed = [math.isfinite(r) for r in ranges]
+    if not any(observed):
+        return len(ranges) * angle_increment
+    start = observed.index(True)                     # rotate so the sequence starts at an observed bin
+    rolled = observed[start:] + observed[:start]
+    widest = run = 0
+    for seen in rolled:
+        run = 0 if seen else run + 1
+        widest = max(widest, run)
+    return widest * angle_increment
+
+
+def publishable(ranges, cloud_age_s: float, max_age_s: float, *, angle_increment: float = math.pi / 180.0,
+                max_gap: float = MAX_UNOBSERVED_GAP) -> tuple[bool, str]:
+    """Whether to publish this scan at all: never a stale cloud, never one without a measured return, never one with
+    an unobserved gap wider than ``max_gap`` anywhere around the robot (rotation sweeps every direction)."""
     if not math.isfinite(cloud_age_s) or cloud_age_s > max_age_s or cloud_age_s < -max_age_s:
         return False, f"cloud age {cloud_age_s:.3f} s outside +-{max_age_s} s"
     if not any(math.isfinite(r) for r in ranges):
         return False, "no measured return in the cloud"
-    coverage = forward_coverage(ranges, angle_min, angle_increment, forward_half_angle)
-    if coverage < min_forward_coverage:
-        return False, f"forward coverage {coverage:.2f} < {min_forward_coverage:.2f} (the travel sector is blind)"
+    gap = max_unobserved_gap(ranges, angle_increment)
+    if gap > max_gap + 1e-9:
+        return False, f"unobserved gap {math.degrees(gap):.1f} deg > {math.degrees(max_gap):.1f} deg"
     return True, ""

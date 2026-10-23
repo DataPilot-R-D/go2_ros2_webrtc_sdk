@@ -18,22 +18,7 @@ from sensor_msgs_py import point_cloud2
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
-from go2_robot_sdk.scan_contract import publishable, ranges_from_points
-
-
-def _quat_rotate(q, v):
-    # Rotate 3-vector v by unit quaternion q (x,y,z,w).
-    qx, qy, qz, qw = q
-    x, y, z = v
-    # q * v * q^-1, standard formula
-    t2 = qw * qx; t3 = qw * qy; t4 = qw * qz
-    t5 = -qx * qx; t6 = qx * qy; t7 = qx * qz
-    t8 = -qy * qy; t9 = qy * qz; t10 = -qz * qz
-    return (
-        2 * ((t8 + t10) * x + (t6 - t4) * y + (t3 + t7) * z) + x,
-        2 * ((t4 + t6) * x + (t5 + t10) * y + (t9 - t2) * z) + y,
-        2 * ((t7 - t3) * x + (t2 + t9) * y + (t5 + t8) * z) + z,
-    )
+from go2_robot_sdk.scan_contract import MAX_UNOBSERVED_GAP, publishable, ranges_from_points, to_frame
 
 
 class PointCloudToScan(Node):
@@ -52,9 +37,9 @@ class PointCloudToScan(Node):
         self.declare_parameter('output_frame', 'radar')
         # T5.9 scan contract: a cloud older than this (vs this node's clock) is never turned into a scan.
         self.declare_parameter('max_cloud_age_s', 0.5)
-        # Coverage of the forward travel sector (Codex #271): UNCALIBRATED fail-closed defaults (scan_contract).
-        self.declare_parameter('min_forward_coverage', 0.5)
-        self.declare_parameter('forward_half_angle_deg', 45.0)
+        # Coverage (Codex #271 / #275): the widest unobserved angular gap allowed anywhere around the robot (rotation
+        # sweeps every direction); the default is scan_contract's stated, UNCALIBRATED assumption.
+        self.declare_parameter('max_unobserved_gap_deg', math.degrees(MAX_UNOBSERVED_GAP))
 
         self.min_height = self.get_parameter('min_height').value
         self.max_height = self.get_parameter('max_height').value
@@ -67,8 +52,7 @@ class PointCloudToScan(Node):
         output_topic = self.get_parameter('output_topic').value
         self.output_frame = self.get_parameter('output_frame').value
         self.max_cloud_age_s = self.get_parameter('max_cloud_age_s').value
-        self.min_forward_coverage = self.get_parameter('min_forward_coverage').value
-        self.forward_half_angle = math.radians(self.get_parameter('forward_half_angle_deg').value)
+        self.max_unobserved_gap = math.radians(self.get_parameter('max_unobserved_gap_deg').value)
 
         self.num_ranges = int(
             (self.angle_max - self.angle_min) / self.angle_increment)
@@ -122,19 +106,14 @@ class PointCloudToScan(Node):
         scan.time_increment = 0.0
         scan.scan_time = 0.1
 
-        def in_frame():
-            for point in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-                rx, ry, rz = _quat_rotate(q, (point[0], point[1], point[2]))   # target = q * src + t
-                yield rx + tx, ry + ty, rz + tz
-
+        points = ((p[0], p[1], p[2]) for p in point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
         ranges = ranges_from_points(
-            in_frame(), min_height=self.min_height, max_height=self.max_height, range_min=self.range_min,
+            to_frame(points, (tx, ty, tz), q), min_height=self.min_height, max_height=self.max_height, range_min=self.range_min,
             range_max=self.range_max, angle_min=self.angle_min, angle_max=self.angle_max,
             angle_increment=self.angle_increment)
         age = (self.get_clock().now() - rclpy.time.Time.from_msg(msg.header.stamp)).nanoseconds / 1e9
-        ok, why = publishable(ranges, age, self.max_cloud_age_s, angle_min=self.angle_min,
-                              angle_increment=self.angle_increment, min_forward_coverage=self.min_forward_coverage,
-                              forward_half_angle=self.forward_half_angle)
+        ok, why = publishable(ranges, age, self.max_cloud_age_s, angle_increment=self.angle_increment,
+                              max_gap=self.max_unobserved_gap)
         if not ok:
             # No scan: the obstacle layer's expected_update_rate stops the controller (sensor-stall contract).
             now_ns = self.get_clock().now().nanoseconds
