@@ -43,6 +43,8 @@ from go2_robot_sdk.actuator_gate_input import POSTURE_LABEL, GateInput, actuator
 from go2_robot_sdk.odometry_velocity import body_velocity, sample as pose_sample
 from go2_robot_sdk.received_frames import ReceivedFrames
 
+PROMPT_PUBLISH_PERIOD_S = 0.02   # lidar / odometry: a new sample waits at most this long for publication
+
 import rclpy
 import rclpy.time
 from rclpy.node import Node
@@ -328,12 +330,22 @@ class RobotBaseNode(Node):
                 qos_profile)
 
         self.timer = self.create_timer(0.1, self.timer_callback)
-        self.timer_lidar = self.create_timer(0.5, self.timer_callback_lidar)
+        # T5.9 (Codex #306): each received lidar frame and pose is published PROMPTLY - its own fast timer takes a new
+        # sample once (an idle tick publishes nothing). A 0.5 s lidar timer sampling a 5 Hz source and odometry on
+        # the 0.1 s general timer made a scan ~0.26 s old (median) at Nav2 although each frame's work is ~17 ms.
+        self.timer_lidar = self.create_timer(PROMPT_PUBLISH_PERIOD_S, self.timer_callback_lidar)
+        self.timer_odometry = self.create_timer(PROMPT_PUBLISH_PERIOD_S, self.timer_callback_odometry)
+
+    def timer_callback_odometry(self):
+        if self.conn_type == 'webrtc':
+            try:
+                self.publish_odometry_webrtc()
+            except Exception as e:
+                self.get_logger().warning(f"Odometry publish error: {e}", throttle_duration_sec=5.0)
 
     def timer_callback(self):
         if self.conn_type == 'webrtc':
             try:
-                self.publish_odometry_webrtc()
                 self.publish_robot_state_webrtc()
                 self.publish_joint_state_webrtc()
             except Exception as e:

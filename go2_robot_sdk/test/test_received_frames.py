@@ -51,11 +51,23 @@ def test_one_received_pose_gives_one_transform_and_one_odometry_with_its_receive
     assert "odom_trans.header.stamp = stamp" in body and "odom_msg.header.stamp = stamp" in body
     assert "Time(nanoseconds=frame.received_ns)" in body
     assert "self.odom_frames.accept(robot_num, msg, self.get_clock().now().nanoseconds)" in source
-    timer = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "timer_callback")
+    timer = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "timer_callback_odometry")
     assert "self.publish_odometry_webrtc()" in ast.unparse(timer)
+    general = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "timer_callback")
+    assert "publish_odometry_webrtc" not in ast.unparse(general)          # not on the 0.1 s general timer
 
 
 def test_a_stopped_odometry_publishes_nothing_more():
     frames = ReceivedFrames()
     frames.accept("0", {"data": {"pose": {}}}, 5)
     assert frames.take("0") is not None and all(frames.take("0") is None for _ in range(10))
+
+
+
+def test_lidar_and_odometry_are_published_promptly_by_their_own_fast_timers():
+    """Codex #306: a 0.5 s lidar timer (and odometry on the 0.1 s general timer) aged every scan ~0.26 s."""
+    source = (SDK_PKG / "go2_robot_sdk" / "go2_driver_node.py").read_text()
+    assert "PROMPT_PUBLISH_PERIOD_S = 0.02" in source
+    assert "self.create_timer(PROMPT_PUBLISH_PERIOD_S, self.timer_callback_lidar)" in source
+    assert "self.create_timer(PROMPT_PUBLISH_PERIOD_S, self.timer_callback_odometry)" in source
+    assert "create_timer(0.5, self.timer_callback_lidar)" not in source
