@@ -18,7 +18,16 @@ if not (CANONICAL / "actuator_mux.py").is_file():
     pytest.skip("monorepo infra/actuator not present", allow_module_level=True)
 sys.path.insert(0, str(CANONICAL))
 
-from actuator_mux import OutputGuard  # noqa: E402
+from actuator_mux import (COMMAND_FUTURE_TOLERANCE_S, COMMAND_MAX_AGE_S, COMMAND_TTL_S, GateLiveness,  # noqa: E402
+                          StampedOutputGuard)
+
+
+def gate_input(cal, mono, ros):
+    """A released C4 gate input (filtered-command guard + gate liveness) on the given clocks."""
+    timing = (COMMAND_TTL_S, COMMAND_MAX_AGE_S, COMMAND_FUTURE_TOLERANCE_S, ros)
+    gi = gate.GateInput(StampedOutputGuard(*timing, clock=mono), GateLiveness(*timing, clock=mono), cal, clock=mono)
+    gi.on_latch(False)
+    return gi
 from go2_robot_sdk import actuator_gate_input as gate  # noqa: E402
 from go2_robot_sdk import actuator_units as units  # noqa: E402
 
@@ -112,17 +121,20 @@ def test_an_unmeasured_direction_is_refused(tmp_path):
 
 
 def test_the_gate_input_sends_calibrated_sticks_and_zero_on_a_refused_command(tmp_path):
-    clock = Clock()
+    clock, ros = Clock(), Clock(1000.0)
     cal = units.load_calibration(write(tmp_path, calibration()))
-    gi = gate.GateInput(OutputGuard(gate.GATE_OUTPUT_TTL_S, clock=clock), cal, clock=clock)
-    gi.on_twist(0.4, 0.0, 1.2)
+    gi = gate_input(cal, clock, ros)
+
+    def at(dt, x, y, z):
+        clock.t += dt
+        ros.t += dt
+        assert gi.on_actuate(ros.t, x, y, z)
+    at(0.01, 0.4, 0.0, 1.2)
     assert sticks(gi.payload_due()) == {"ly": 0.5, "lx": 0.0, "rx": -0.8, "ry": 0}
-    clock.t += 0.05
-    gi.on_twist(-0.1, 0.0, 0.0)                               # reverse was never measured
+    at(0.05, -0.1, 0.0, 0.0)                                  # reverse was never measured
     assert sticks(gi.payload_due()) == ZERO
     assert gi.refused == 1 and gi.last_refused == (-0.1, 0.0, 0.0)
-    clock.t += 0.05
-    gi.on_twist(0.0, 0.0, 0.0)
+    at(0.05, 0.0, 0.0, 0.0)
     assert gi.payload_due() is None and gi.refused == 1      # the same explicit zero is already out (refresh rule)
     clock.t += gate.REFRESH_S
     assert sticks(gi.payload_due()) == ZERO
@@ -130,7 +142,7 @@ def test_the_gate_input_sends_calibrated_sticks_and_zero_on_a_refused_command(tm
 
 def test_the_gate_input_cannot_be_built_without_a_calibration():
     with pytest.raises(TypeError):
-        gate.GateInput(OutputGuard(gate.GATE_OUTPUT_TTL_S))      # noqa - the calibration is a required argument
+        gate.GateInput(object(), object())                    # noqa - the calibration is a required argument
 
 
 def test_the_driver_loads_the_calibration_before_building_the_gate_input():
@@ -139,7 +151,7 @@ def test_the_driver_loads_the_calibration_before_building_the_gate_input():
     branch = source[source.index("if self.actuator_mode == 'gate':"):source.index("# Legacy (default)")]
     assert "gate_calibration(os.environ)" in branch
     assert branch.index("gate_calibration(os.environ)") < branch.index("GateInput(")
-    assert "GateInput(OutputGuard(GATE_OUTPUT_TTL_S), calibration)" in branch
+    assert "GateInput(StampedOutputGuard(*timing), GateLiveness(*timing), calibration)" in branch
 
 
 def test_legacy_mode_is_unchanged_and_distinct():
@@ -150,13 +162,15 @@ def test_legacy_mode_is_unchanged_and_distinct():
 
 def test_every_new_refusal_is_reported_once_and_the_driver_logs_it_bounded(tmp_path):
     """Codex #244: a refused command is an explicit zero AND a warning; the driver throttles the log."""
-    clock = Clock()
+    clock, ros = Clock(), Clock(1000.0)
     cal = units.load_calibration(write(tmp_path, calibration()))
-    gi = gate.GateInput(OutputGuard(gate.GATE_OUTPUT_TTL_S, clock=clock), cal, clock=clock)
-    gi.on_twist(0.4, 0.0, 0.0)
+    gi = gate_input(cal, clock, ros)
+    ros.t += 0.01
+    gi.on_actuate(ros.t, 0.4, 0.0, 0.0)
     gi.payload_due()
     assert gi.refusal_report() is None                        # nothing refused
-    gi.on_twist(-0.1, 0.0, 0.0)
+    ros.t += 0.01
+    gi.on_actuate(ros.t, -0.1, 0.0, 0.0)
     gi.payload_due()
     report = gi.refusal_report()
     assert report and "refused 1 command" in report and "(-0.1, 0.0, 0.0)" in report

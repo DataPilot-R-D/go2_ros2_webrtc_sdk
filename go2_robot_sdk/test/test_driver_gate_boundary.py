@@ -43,13 +43,23 @@ def _in_gate_mode(sub):
     return True
 
 
-def test_gate_mode_has_exactly_the_gate_output_as_its_velocity_input():
-    velocity = [s for s in _subscriptions() if s["type"] == "Twist" and _in_gate_mode(s)]
-    assert [s["topic"] for s in velocity] == ["cmd_vel_mux"]
+def test_gate_mode_has_exactly_the_filtered_command_as_its_velocity_input():
+    """C4: the collision monitor's stamped output is the only velocity; the gate's stamped stream feeds posture
+    liveness only; the unfiltered gate output cmd_vel_mux is never subscribed in gate mode."""
+    stamped = [s for s in _subscriptions() if s["type"] == "TwistStamped" and _in_gate_mode(s)]
+    assert [(s["topic"], s["callback"].split("(")[0].split(".")[-1]) for s in stamped] == [
+        ("cmd_vel_actuate", "on_actuate"), ("cmd_vel_gate", "on_gate")]
+    assert not [s for s in _subscriptions() if s["type"] == "Twist" and _in_gate_mode(s)]
+    assert not [s for s in _subscriptions() if s["topic"] == "cmd_vel_mux" and _in_gate_mode(s)]
+
+
+def test_gate_mode_hears_the_safety_latch_directly():
+    latch = [s for s in _subscriptions() if s["topic"] == "cmd_vel_lock" and _in_gate_mode(s)]
+    assert len(latch) == 1 and latch[0]["type"] == "Bool" and "on_latch" in latch[0]["callback"]
 
 
 def test_the_raw_velocity_topics_and_the_joystick_exist_only_in_legacy_mode():
-    raw = [s for s in _subscriptions() if s["type"] in ("Twist", "Joy") and s["topic"] != "cmd_vel_mux"]
+    raw = [s for s in _subscriptions() if s["type"] in ("Twist", "Joy")]
     assert raw and not [s for s in raw if _in_gate_mode(s)], raw
 
 

@@ -51,11 +51,11 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from tf2_ros import TransformBroadcaster, TransformStamped
-from geometry_msgs.msg import Twist, TransformStamped, PoseStamped
+from geometry_msgs.msg import Twist, TwistStamped, TransformStamped, PoseStamped
 from go2_interfaces.msg import Go2State, IMU, LowState
 from sensor_msgs.msg import PointCloud2, PointField, JointState, Joy
 from sensor_msgs_py import point_cloud2
-from std_msgs.msg import Empty, Header, String
+from std_msgs.msg import Bool, Empty, Header, String
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Image, CameraInfo
 
@@ -182,27 +182,47 @@ class RobotBaseNode(Node):
 
         self.joy_state = Joy()
 
-        # T5.9 GO2_ACTUATOR_MODE=gate: the driver obeys ONLY the shared actuator gate
-        # (cmd_vel_mux, infra/actuator - the simulator's arbitration) and guards it with
-        # its own TTL; no raw velocity topic and no joystick can move the robot.
+        # T5.9 / C4 GO2_ACTUATOR_MODE=gate: the driver obeys ONLY the collision monitor's
+        # filtered command (cmd_vel_actuate, the gate's stamped decision filtered), under the
+        # shared StampedOutputGuard with the Safety latch's downstream authority; posture uses
+        # the gate's own stamped stream (cmd_vel_gate). The gate output cmd_vel_mux, raw
+        # velocity topics and the joystick never move the robot.
         self.actuator_mode = actuator_mode(os.environ)
         self._gate_input = None
         if self.actuator_mode == 'gate':
             if self.conn_mode != 'single':
                 raise RuntimeError('GO2_ACTUATOR_MODE=gate drives one robot per driver')
-            from actuator_mux import OutputGuard  # canonical infra/actuator (go2-native.sh puts it on sys.path)
-            from go2_robot_sdk.actuator_gate_input import GATE_OUTPUT_TTL_S
+            # canonical infra/actuator (go2-native.sh / the robot-host image put it on sys.path)
+            from actuator_mux import (COMMAND_FUTURE_TOLERANCE_S, COMMAND_MAX_AGE_S, COMMAND_TTL_S, GateLiveness,
+                                      StampedOutputGuard)
             from go2_robot_sdk.actuator_units import gate_calibration
             # Codex #228 / #242: no measured SI-to-joystick calibration, no autonomous gate mode (refuses to start).
             calibration = gate_calibration(os.environ)
             self.get_logger().info(
                 f'gate mode: joystick calibration {calibration.sha256[:12]} (robot {calibration.robot_serial}, '
                 f'measured {calibration.measured_at})')
-            self._gate_input = GateInput(OutputGuard(GATE_OUTPUT_TTL_S), calibration)
+            ros_now = lambda: self.get_clock().now().nanoseconds / 1e9  # noqa: E731 - the stamps' clock
+            timing = (COMMAND_TTL_S, COMMAND_MAX_AGE_S, COMMAND_FUTURE_TOLERANCE_S, ros_now)
+            self._gate_input = GateInput(StampedOutputGuard(*timing), GateLiveness(*timing), calibration)
+
+            def stamp(msg):
+                return msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
             self.create_subscription(
-                Twist,
-                'cmd_vel_mux',
-                lambda msg: self._gate_input.on_twist(msg.linear.x, msg.linear.y, msg.angular.z),
+                TwistStamped,
+                'cmd_vel_actuate',
+                lambda msg: self._gate_input.on_actuate(stamp(msg), msg.twist.linear.x, msg.twist.linear.y,
+                                                        msg.twist.angular.z),
+                qos_profile)
+            self.create_subscription(
+                TwistStamped,
+                'cmd_vel_gate',
+                lambda msg: self._gate_input.on_gate(stamp(msg), msg.twist.linear.x, msg.twist.linear.y,
+                                                     msg.twist.angular.z),
+                qos_profile)
+            self.create_subscription(
+                Bool,
+                'cmd_vel_lock',
+                lambda msg: self._gate_input.on_latch(bool(msg.data)),
                 qos_profile)
             # The gate's own status gates posture commands (they move the body too).
             self.create_subscription(

@@ -1,11 +1,15 @@
-"""Driver side of the shared actuator gate (T5.9): in gate mode the Go2 obeys ONLY the gate output (cmd_vel_mux).
+"""Driver side of the shared actuator gate (T5.9, C4): in gate mode the Go2 obeys ONLY the collision monitor's filtered
+command (cmd_vel_actuate), which carries the gate's decision stamp.
 
-The gate (monorepo infra/actuator/actuator_mux.py - the same arbitration the simulator runs) owns input priority,
-the Safety latch and the Bridge-heartbeat watchdog, and publishes an explicit zero when nothing may move the robot.
-A gate that dies cannot send that zero, so the driver guards the gate output with its OWN monotonic TTL
-(``OutputGuard``) and sends an explicit zero stick state when the output is stale or was never received. An
-unchanged command is not resent every tick (the WebRTC data channel starves under load) but at least every
-``REFRESH_S``, so a lost message can never leave the robot on an old stick state for long.
+The gate (monorepo infra/actuator/actuator_mux.py - the same arbitration the simulator runs) owns input priority, the
+Safety latch and the Bridge-heartbeat watchdog, and publishes an explicit zero when nothing may move the robot; the
+collision monitor filters that decision. Both can die, so the driver guards the filtered command with the shared
+``StampedOutputGuard``: the source age and receipt TTL at every use, strict stamp order after the last latch release,
+and the Safety latch with downstream authority (engaging it erases the command). It sends an explicit zero stick
+state otherwise. Posture commands use ``GateLiveness``, the gate's own stamped stream, not the monitor, which falls
+silent at rest. An unchanged command is not resent every tick (the WebRTC data channel starves under load) but at
+least every ``REFRESH_S``, so a lost message can never leave the robot on an old stick state for long. The timing is
+the shared core's ``COMMAND_*`` - one definition with the simulator (Codex #401).
 
 No ROS import: the node wires it (go2_driver_node.py, GO2_ACTUATOR_MODE=gate) and tests run offline.
 """
@@ -15,8 +19,6 @@ import json
 import time
 
 ACTUATOR_MODES = ("legacy", "gate")
-# The simulator's consumer TTL for the same gate output (repos/sim ros2_bridge MUX_COMMAND_TIMEOUT_S; test-bound).
-GATE_OUTPUT_TTL_S = 0.5
 REFRESH_S = 0.5
 # The gate publishes cmd_vel_mux_status on every change and at least once a second; posture commands need it fresh.
 STATUS_TTL_S = 2.0
@@ -51,10 +53,13 @@ ZERO_STICKS = {"lx": 0, "ly": 0, "rx": 0, "ry": 0}
 
 
 class GateInput:
-    """The one velocity input of a gate-mode driver: SI commands through the measured calibration (required)."""
+    """The one velocity input of a gate-mode driver: SI commands through the measured calibration (required).
+    ``guard``: actuator_mux.StampedOutputGuard over the filtered command; ``liveness``: actuator_mux.GateLiveness over
+    the gate's own stamped stream (posture)."""
 
-    def __init__(self, guard, calibration, refresh_s: float = REFRESH_S, clock=time.monotonic):
+    def __init__(self, guard, liveness, calibration, refresh_s: float = REFRESH_S, clock=time.monotonic):
         self._guard = guard
+        self._liveness = liveness
         self._calibration = calibration
         self.refused = 0                 # commands refused by the units contract (sent as an explicit zero)
         self.last_refused = None
@@ -65,8 +70,18 @@ class GateInput:
         self._last_sent = float("-inf")
         self._status: tuple[float, bool] | None = None   # (received_at, no lock engaged)
 
-    def on_twist(self, linear_x: float, linear_y: float, angular_z: float) -> None:
-        self._guard.on_output((linear_x, linear_y, 0.0, angular_z))
+    def on_actuate(self, stamp: float, linear_x: float, linear_y: float, angular_z: float) -> bool:
+        """The collision monitor's filtered command (the only velocity); False when the guard refuses it."""
+        return self._guard.on_output(stamp, (linear_x, linear_y, 0.0, angular_z))
+
+    def on_gate(self, stamp: float, linear_x: float, linear_y: float, angular_z: float) -> bool:
+        """The gate's own stamped decision: its liveness for posture, never a velocity."""
+        return self._liveness.on_gate_output(stamp, (linear_x, linear_y, 0.0, angular_z))
+
+    def on_latch(self, engaged: bool) -> None:
+        """The Safety latch, with downstream authority over both the command and posture."""
+        self._guard.on_latch(engaged)
+        self._liveness.on_latch(engaged)
 
     def on_status(self, raw: str) -> None:
         """The gate's JSON status ({source, locked_by}); anything malformed counts as locked."""
@@ -88,9 +103,10 @@ class GateInput:
                 "(an unmeasured direction or an axis beyond [-1, 1]); sent an explicit zero")
 
     def motion_allowed(self) -> bool:
-        """Posture commands (stand up / down, wake up) move the body: only while the gate is ALIVE (fresh output,
-        the same TTL as velocity - Codex #191) and its own fresh status says no lock is engaged."""
-        return (self._guard.fresh() and self._status is not None and self._status[1]
+        """Posture commands (stand up / down, wake up) move the body: only while the gate is ALIVE - its own stamped
+        stream fresh after the last latch release (GateLiveness, independent of the monitor's silence at rest, Codex
+        #395 / #397) - and its own fresh status says no lock is engaged (Codex #191)."""
+        return (self._liveness.allowed() and self._status is not None and self._status[1]
                 and self._clock() - self._status[0] < STATUS_TTL_S)
 
     def payload_due(self) -> str | None:
