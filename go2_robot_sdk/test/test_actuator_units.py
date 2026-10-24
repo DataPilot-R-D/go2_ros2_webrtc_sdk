@@ -178,3 +178,24 @@ def test_every_new_refusal_is_reported_once_and_the_driver_logs_it_bounded(tmp_p
     source = (SDK_PKG / "go2_robot_sdk" / "go2_driver_node.py").read_text()
     tick = source[source.index("payload = self._gate_input.payload_due()"):][:600]
     assert "refusal_report()" in tick and "throttle_duration_sec=2.0" in tick
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_filtered_command_right_after_a_moving_one_sends_zero(tmp_path, axis, bad):
+    """Codex #409: the shared guard refuses the vector at the boundary and erases the moving command, so the driver
+    sends an explicit zero - the same outcome as the simulator - and only a newer finite command drives again."""
+    clock, ros = Clock(), Clock(1000.0)
+    gi = gate_input(units.load_calibration(write(tmp_path, calibration())), clock, ros)
+    ros.t += 0.01
+    assert gi.on_actuate(ros.t, 0.4, 0.0, 0.0)
+    assert sticks(gi.payload_due())["ly"] == 0.5
+    command = [0.4, 0.0, 0.0]
+    command[axis] = bad
+    ros.t += 0.01
+    clock.t += 0.01
+    assert gi.on_actuate(ros.t, *command) is False
+    assert sticks(gi.payload_due()) == ZERO
+    ros.t += 0.01
+    clock.t += gate.REFRESH_S
+    assert gi.on_actuate(ros.t, 0.4, 0.0, 0.0) and sticks(gi.payload_due())["ly"] == 0.5
